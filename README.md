@@ -14,7 +14,8 @@ head-to-head numbers.
 ## Usage
 
     ./chess [limit]
-    ./chess demo [limit]   # self-playing demo, board after every move
+    ./chess demo [limit]         # self-playing demo, board after every move
+    ./chess silentdemo [limit]   # same demo without boards (moves only)
 
 - The single optional argument is the computer's per-move limit — there is
   always **exactly one limiting resource per mode**:
@@ -70,6 +71,32 @@ typed `c` forever, and the board is redrawn after every move (an implicit
 `d`). Limit semantics are identical to normal mode (default 600 s/move,
 negative = fixed depth, `0` = RAM-limited); use `./chess demo 1` for a fast
 ~1 s/move show. Ends with the normal result line.
+
+`./chess silentdemo [limit]` (alias `sdemo`) — exactly the same, but the
+board printouts are skipped: output is just the move list (plus `check` and
+the final result line). Nothing else differs.
+
+### Verbose / debug mode
+
+`VERBOSE=1 ./chess ...` prints a full technical trace of the engine's
+thinking to **stderr** (stdout remains the clean move protocol, so you can
+pipe/tee it in any mode, including the demos):
+
+- startup: hash-table size, Go memory limit, thread count
+- per search: side to move, active limit (time/depth/RAM), legal-move count
+- per completed depth: depth, selective depth (deepest quiescence ply),
+  score (`cp` or `mate n`), best move, node count, nodes/sec, hash-table
+  fill %, and the principal variation reconstructed from the hash table
+- aspiration-window events (`fail-low`/`fail-high` + re-search window)
+- 0-mode: RAM-budget progress every 10% (stores used, nodes, table fill)
+- per move played: final depth/seldepth, score, total nodes (exact), nps,
+  wall time, table fill, Go heap in use / reserved
+- after every applied move: the position as a FEN string + zobrist key
+
+Every line is stamped `[seconds.milliseconds]` since program start. With
+`VERBOSE` unset (or `0`) none of the instrumentation runs — no extra
+atomics, no timers, no allocations — the engine is bit-for-bit as fast as
+before. `CHESS_VERBOSE=1` still prints just the one startup line.
 
 ## Full rules implemented
 

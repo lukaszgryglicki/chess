@@ -18,6 +18,9 @@
 //
 // Memory can never OOM: all data is fixed-size + a Go runtime memory limit.
 // Searches in parallel on all CPU cores (Lazy SMP, shared lock-free TT).
+// Extra modes: "demo" = self-play with the board after every move,
+// "silentdemo" = the same without boards; VERBOSE=1 env = full search/
+// debug trace on stderr (zero overhead when off; stdout stays protocol).
 // Build: go build -o chess chess.go
 // Self-test (perft + zobrist): CHESS_SELFTEST=1 ./chess
 package main
@@ -961,7 +964,7 @@ func initTT() {
 		head = min
 	}
 	debug.SetMemoryLimit(int64(ttSize*ttEntryBytes + head))
-	if os.Getenv("CHESS_VERBOSE") == "1" {
+	if os.Getenv("CHESS_VERBOSE") == "1" || verbose {
 		fmt.Fprintf(os.Stderr, "hash: %d MB | memory limit: %d MB | threads: %d\n",
 			ttSize*ttEntryBytes>>20, (ttSize*ttEntryBytes+head)>>20, runtime.NumCPU())
 	}
@@ -999,15 +1002,171 @@ func ttStore(hash uint64, m Move, score, depth, flag, ply int) {
 	ttStores.Add(1)
 }
 
+// ---------- verbose / debug instrumentation (VERBOSE=1) ----------
+
+// verbose enables a full search/debug trace on stderr: per-depth results
+// with score + PV, aspiration re-searches, 0-mode RAM-budget progress,
+// per-move summaries (nodes, nps, seldepth, TT fill, heap) and every
+// position as FEN + zobrist key. stdout stays a clean move protocol.
+var verbose = os.Getenv("VERBOSE") != "" && os.Getenv("VERBOSE") != "0"
+
+var startTime = time.Now()
+
+// vlog prints one timestamped (seconds since program start) stderr line.
+func vlog(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "[%8.3f] "+format+"\n",
+		append([]any{time.Since(startTime).Seconds()}, a...)...)
+}
+
+func fmtN(n uint64) string {
+	switch {
+	case n >= 1e9:
+		return fmt.Sprintf("%.2fG", float64(n)/1e9)
+	case n >= 1e6:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1e3:
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	}
+	return strconv.FormatUint(n, 10)
+}
+
+func scoreStr(s int) string {
+	if s > MateScore-2000 {
+		return fmt.Sprintf("mate %d", (MateScore-s+1)/2)
+	}
+	if s < -(MateScore - 2000) {
+		return fmt.Sprintf("mate -%d", (MateScore+s+1)/2)
+	}
+	return fmt.Sprintf("cp %d", s)
+}
+
+// ttFullPct estimates hash-table fill by sampling up to 8192 entries.
+func ttFullPct() float64 {
+	n := uint64(8192)
+	if n > ttSize {
+		n = ttSize
+	}
+	step := ttSize / n
+	used := 0
+	for i := uint64(0); i < n; i++ {
+		e := &ttTable[i*step]
+		if atomic.LoadUint64(&e.xkey) != 0 || atomic.LoadUint64(&e.data) != 0 {
+			used++
+		}
+	}
+	return 100 * float64(used) / float64(n)
+}
+
+func toFEN(p *Pos) string {
+	var sb strings.Builder
+	for r := 7; r >= 0; r-- {
+		empty := 0
+		for f := 0; f < 8; f++ {
+			pc := p.b[r*8+f]
+			if pc == Empty {
+				empty++
+				continue
+			}
+			if empty > 0 {
+				sb.WriteByte(byte('0' + empty))
+				empty = 0
+			}
+			if pc > 0 {
+				sb.WriteByte("PNBRQK"[pc-1])
+			} else {
+				sb.WriteByte("pnbrqk"[-pc-1])
+			}
+		}
+		if empty > 0 {
+			sb.WriteByte(byte('0' + empty))
+		}
+		if r > 0 {
+			sb.WriteByte('/')
+		}
+	}
+	if p.side == White {
+		sb.WriteString(" w ")
+	} else {
+		sb.WriteString(" b ")
+	}
+	cr := ""
+	if p.rights&CastleWK != 0 {
+		cr += "K"
+	}
+	if p.rights&CastleWQ != 0 {
+		cr += "Q"
+	}
+	if p.rights&CastleBK != 0 {
+		cr += "k"
+	}
+	if p.rights&CastleBQ != 0 {
+		cr += "q"
+	}
+	if cr == "" {
+		cr = "-"
+	}
+	sb.WriteString(cr)
+	if p.ep >= 0 {
+		sb.WriteString(" " + sqName(p.ep))
+	} else {
+		sb.WriteString(" -")
+	}
+	full := 1
+	if n := len(p.hist); n > 0 {
+		full = (n-1)/2 + 1
+	}
+	sb.WriteString(fmt.Sprintf(" %d %d", p.half, full))
+	return sb.String()
+}
+
+// pvString reconstructs the principal variation by walking the TT from the
+// root, validating every move against the legal list (races can only
+// truncate the line, never corrupt it).
+func pvString(root *Pos, first Move, maxLen int) string {
+	p := root.clone()
+	var sb strings.Builder
+	seen := make(map[uint64]bool, maxLen)
+	m := first
+	for i := 0; i < maxLen; i++ {
+		ok := false
+		for _, lm := range p.genLegal() {
+			if lm == m {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			break
+		}
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(moveStr(m))
+		p.make(m)
+		if seen[p.hash] {
+			break
+		}
+		seen[p.hash] = true
+		tm, _, _, _, hit := ttProbe(p.hash)
+		if !hit || tm == NoMove {
+			break
+		}
+		m = tm
+	}
+	return sb.String()
+}
+
 // ---------- search ----------
 
 // searchCtl is shared by all parallel search workers.
 type searchCtl struct {
 	stop        atomic.Bool
 	hasDeadline bool
-	deadline    time.Time // hard stop, enforced inside the search
-	soft        time.Time // don't start another iteration after this
-	memLimited  bool      // 0-mode: stop when the hash capacity is used up
+	deadline    time.Time     // hard stop, enforced inside the search
+	soft        time.Time     // don't start another iteration after this
+	memLimited  bool          // 0-mode: stop when the hash capacity is used up
+	nodes       atomic.Uint64 // ~nodes this move (flushed every 1024/worker)
+	nextMark    atomic.Uint64 // verbose: next 0-mode progress checkpoint
 }
 
 type Engine struct {
@@ -1015,6 +1174,7 @@ type Engine struct {
 	ctl       *searchCtl
 	stop      bool
 	nodes     uint64
+	seldepth  int // deepest ply touched (incl. quiescence)
 	killers   [MaxPly][2]Move
 	history   [2][64][64]int32
 	counter   [2][64][64]Move // countermove heuristic, indexed by prev move
@@ -1024,6 +1184,9 @@ type Engine struct {
 func (e *Engine) checkTime() {
 	if e.nodes&1023 != 0 {
 		return
+	}
+	if verbose {
+		e.ctl.nodes.Add(1024) // stats only kept in verbose mode
 	}
 	if e.ctl.stop.Load() {
 		e.stop = true
@@ -1035,9 +1198,20 @@ func (e *Engine) checkTime() {
 	}
 	// RAM-limited (0) mode: the move's budget is one full hash table's worth
 	// of stored positions - the only limit in this mode is memory capacity.
-	if e.ctl.memLimited && ttStores.Load() >= ttSize {
-		e.ctl.stop.Store(true)
-		e.stop = true
+	if e.ctl.memLimited {
+		st := ttStores.Load()
+		if verbose {
+			if mark := e.ctl.nextMark.Load(); mark != 0 && st >= mark &&
+				e.ctl.nextMark.CompareAndSwap(mark, mark+(ttSize+9)/10) {
+				vlog("ram: %d%% of budget (%s / %s stores) | nodes %s | tt %.1f%%",
+					100*st/ttSize, fmtN(st), fmtN(ttSize),
+					fmtN(e.ctl.nodes.Load()), ttFullPct())
+			}
+		}
+		if st >= ttSize {
+			e.ctl.stop.Store(true)
+			e.stop = true
+		}
 	}
 }
 
@@ -1237,6 +1411,9 @@ func (e *Engine) orderMoves(moves []Move, ttMove Move, ply int, prev Move) {
 
 func (e *Engine) quiesce(alpha, beta, ply int) int {
 	e.nodes++
+	if verbose && ply > e.seldepth {
+		e.seldepth = ply
+	}
 	e.checkTime()
 	if e.stop {
 		return 0
@@ -1581,11 +1758,16 @@ func (e *Engine) rootSearch(moves []Move, depth, alpha, beta int) (int, Move) {
 // played moves always come from the legal list, so races can never yield an
 // illegal move.
 func bestMove(p *Pos, budget, depthCap int) Move {
+	searchStart := time.Now()
 	legal := p.genLegal()
 	if len(legal) == 0 {
 		return NoMove
 	}
+	workers := runtime.NumCPU()
 	if len(legal) == 1 {
+		if verbose {
+			vlog("forced: only one legal move -> %s", moveStr(legal[0]))
+		}
 		return legal[0]
 	}
 	maxD := MaxDepth
@@ -1594,26 +1776,51 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 	}
 	c := &searchCtl{}
 	if budget > 0 {
-		start := time.Now()
 		c.hasDeadline = true
-		c.deadline = start.Add(time.Duration(budget) * time.Second)
-		c.soft = start.Add(time.Duration(budget) * time.Second * 55 / 100)
+		c.deadline = searchStart.Add(time.Duration(budget) * time.Second)
+		c.soft = searchStart.Add(time.Duration(budget) * time.Second * 55 / 100)
 	} else if depthCap == 0 {
 		// 0 = RAM-limited: no clock, no depth cap; think until this move has
 		// stored one full hash table's worth of positions, then play.
 		c.memLimited = true
 		ttStores.Store(0)
+		if verbose {
+			c.nextMark.Store((ttSize + 9) / 10)
+		}
+	}
+	if verbose {
+		var mode string
+		switch {
+		case budget > 0:
+			mode = fmt.Sprintf("TIME %d s (soft-stop %.1f s)", budget, float64(budget)*0.55)
+		case depthCap > 0:
+			mode = fmt.Sprintf("DEPTH %d", depthCap)
+		default:
+			mode = fmt.Sprintf("RAM %s stores / %d MB hash", fmtN(ttSize), ttSize*ttEntryBytes>>20)
+		}
+		side := "white"
+		if p.side == Black {
+			side = "black"
+		}
+		vlog("search: %s to move | limit: %s | legal: %d | threads: %d",
+			side, mode, len(legal), workers)
 	}
 	var mu sync.Mutex
 	best := legal[0]
-	bestDepth := 0
+	bestDepth, bestScore := 0, 0
+	var engines []*Engine // verbose-only stats; nil otherwise
+	if verbose {
+		engines = make([]*Engine, workers)
+	}
 	var wg sync.WaitGroup
-	workers := runtime.NumCPU()
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			e := &Engine{p: p.clone(), ctl: c}
+			if verbose {
+				engines[w] = e
+			}
 			moves := append([]Move(nil), legal...)
 			myBest := moves[0]
 			prevScore := 0
@@ -1639,10 +1846,19 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 						break
 					}
 					window *= 3
-					if iterScore <= alpha {
+					failLow := iterScore <= alpha
+					if failLow {
 						alpha = iterScore - window
 					} else {
 						beta = iterScore + window
+					}
+					if verbose {
+						dir := "high"
+						if failLow {
+							dir = "low"
+						}
+						vlog("[w%02d] depth %d fail-%s (%s) -> re-search window (%d, %d)",
+							w, depth, dir, scoreStr(iterScore), alpha, beta)
 					}
 					if alpha < -MateScore {
 						alpha = -Inf
@@ -1662,6 +1878,19 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 					if depth > bestDepth {
 						bestDepth = depth
 						best = myBest
+						bestScore = iterScore
+						if verbose {
+							el := time.Since(searchStart).Seconds()
+							nodes := c.nodes.Load()
+							var nps uint64
+							if el > 0 {
+								nps = uint64(float64(nodes) / el)
+							}
+							vlog("depth %2d sel %2d | %s | best %s | nodes %s | nps %s | tt %.1f%% | pv %s",
+								depth, e.seldepth, scoreStr(iterScore), moveStr(myBest),
+								fmtN(nodes), fmtN(nps), ttFullPct(),
+								pvString(p, myBest, imin(depth, 12)))
+						}
 					}
 					mu.Unlock()
 				}
@@ -1674,6 +1903,28 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 		}(w)
 	}
 	wg.Wait()
+	if verbose {
+		var nodes uint64
+		sel := 0
+		for _, e := range engines {
+			if e != nil {
+				nodes += e.nodes
+				if e.seldepth > sel {
+					sel = e.seldepth
+				}
+			}
+		}
+		el := time.Since(searchStart).Seconds()
+		var nps uint64
+		if el > 0 {
+			nps = uint64(float64(nodes) / el)
+		}
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		vlog("played %s | depth %d sel %d | %s | nodes %s | nps %s | time %.2f s | tt %.1f%% | heap %d MB (sys %d MB)",
+			moveStr(best), bestDepth, sel, scoreStr(bestScore), fmtN(nodes),
+			fmtN(nps), el, ttFullPct(), ms.HeapAlloc>>20, ms.Sys>>20)
+	}
 	return best
 }
 
@@ -1834,18 +2085,28 @@ func main() {
 		return
 	}
 	budget, depthCap := 600, 0
-	demo := false
+	demo, silent := false, false
 	args := os.Args[1:]
-	if len(args) > 0 && strings.EqualFold(args[0], "demo") {
-		demo = true
-		args = args[1:]
+	if len(args) > 0 {
+		switch {
+		case strings.EqualFold(args[0], "demo"):
+			demo = true
+			args = args[1:]
+		case strings.EqualFold(args[0], "silentdemo"), strings.EqualFold(args[0], "sdemo"):
+			demo, silent = true, true
+			args = args[1:]
+		}
 	}
 	usage := func() {
-		fmt.Fprintln(os.Stderr, "usage: chess [demo] [limit]  (exactly one limit per mode)")
+		fmt.Fprintln(os.Stderr, "usage: chess [demo|silentdemo] [limit]  (exactly one limit per mode)")
 		fmt.Fprintln(os.Stderr, "  limit > 0: TIME-limited - max seconds per move (default 600)")
 		fmt.Fprintln(os.Stderr, "  limit < 0: DEPTH-limited - fixed search depth (-10 = depth 10)")
 		fmt.Fprintln(os.Stderr, "  limit = 0: RAM-limited - hash auto-sized from available RAM")
 		fmt.Fprintln(os.Stderr, "             (CHESS_HASH_MB overrides); moves when it's used up")
+		fmt.Fprintln(os.Stderr, "  demo: computer plays both sides, board redrawn after every move")
+		fmt.Fprintln(os.Stderr, "  silentdemo: same but without the boards (moves + result only)")
+		fmt.Fprintln(os.Stderr, "  env: VERBOSE=1 full search/debug trace on stderr")
+		fmt.Fprintln(os.Stderr, "       CHESS_HASH_MB=<mb> hash size | CHESS_FEN=<fen> start position")
 		os.Exit(1)
 	}
 	if len(args) > 1 {
@@ -1883,6 +2144,9 @@ func main() {
 	// Returns false when the game is over (result already printed).
 	play := func(m Move, announce bool) bool {
 		p.make(m)
+		if verbose {
+			vlog("pos after %s: %s | key %016x", moveStr(m), toFEN(p), p.hash)
+		}
 		if announce {
 			fmt.Fprintln(out, moveStr(m))
 			out.Flush()
@@ -1900,14 +2164,22 @@ func main() {
 	}
 
 	// DEMO mode: the computer plays both sides (as if the human typed "c"
-	// forever) and the board is redrawn after every move ("d" after each).
-	// Same think-time semantics as normal mode.
+	// forever); board redrawn after every move ("d" after each) unless
+	// silent (silentdemo), which only skips the board printouts.
+	// Same limit semantics as normal mode.
 	if demo {
 		for {
 			m := bestMove(p, budget, depthCap)
 			p.make(m)
+			if verbose {
+				vlog("pos after %s: %s | key %016x", moveStr(m), toFEN(p), p.hash)
+			}
 			fmt.Fprintln(out, moveStr(m))
-			drawBoard(p, out)
+			if silent {
+				out.Flush() // drawBoard would otherwise flush
+			} else {
+				drawBoard(p, out)
+			}
 			if res, why := gameResult(p); res != "" {
 				fmt.Fprintln(out, res+" "+why)
 				out.Flush()

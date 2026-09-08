@@ -97,3 +97,41 @@ This feature set typically lands a single-file engine around strong-club /
 master strength even at 1 s/move — far beyond casual human play — while v1
 was a solid hobby baseline. Qwen's entry will be benchmarked against BOTH
 (v1 for fairness, v2 for fun).
+
+## v3 — match-validated SOTA pass (follow-up request, same session)
+
+Request: "best chess ever possible, ≥4 passes, keep the modes, 0-mode at
+80% of available RAM". Method: **match-driven development** — a referee
+script plays the candidate against the previous binary from 10 fixed
+openings (fresh process per move, threefold/50-move adjudication, Elo ±95%
+CI); a pass only ships if it wins at real time controls, otherwise it is
+reverted. A 16-position Win-At-Chess tactical sample and the 13/13 perft +
+zobrist + pawn-key node-level verification gate every build.
+
+| pass | features | verdict @1 s/move |
+|---|---|---|
+| 1 | new 24-byte TT (generation aging, 2-way buckets, depth-protected replacement, cached static evals), quiescence TT, continuation + capture history with gravity updates, improving flag, razoring, eval-scaled null-move R + verification search, history-driven LMR, persistent per-thread engines, 0-mode → 80% RAM (cap 64 GB) | **+70 Elo** (+11 =26 −3) |
+| 2 | bitboard-assisted eval rewrite: mobility, king-safety attack units, threats/hanging men, passer blockade + king proximity, connected pawns, pawn hash table, OCB/pawnless drawishness scaling; verified mirror-symmetric | **+108 Elo** (+16 =20 −4) |
+| 3 | incremental pawn zobrist (node-verified), **singular extensions + multicut**, **probcut**, **correction history**, SEE pruning of quiets and losing captures | **+44 Elo** over 80 games (+18 =54 −8) |
+| 4 | adaptive stability-based time management — tested twice, no gain at 1 s (−17, −26) | **reverted** (binary byte-identical to pass 3) |
+
+Chained per-pass gains sum to ≈ +220, and the independent headline match —
+**final vs v2, 60 games at 1 s/move: +34 =19 −7, 72.5%, +168 Elo
+[+79, +285]** — confirms a decisive upgrade. Fixed-depth
+matches turned out to be the wrong metric — pass 1 measured −98 "Elo" at
+fixed depth 5 while being +70 at equal wall clock, because the new pruning
+reaches the same depth in ~8–26× fewer nodes; all verdicts above are
+wall-clock time controls, the thing that actually matters.
+
+Interesting engineering notes:
+- The pass-1 "regression" hunt found one real bug the gauntlet exposed:
+  quiescence depth-0 stores were overwriting deep same-key TT entries;
+  fixed with depth-protected replacement (age-refresh instead).
+- Correction history + pawn hash both key off a pawn zobrist that is
+  maintained incrementally in make/unmake and re-verified against a
+  from-scratch recomputation at every node of the perft suite.
+- WAC tactical sample: 14/16 at 2 s/move (both misses are deep sacrifice
+  lines; v2 scored the same 14/16 while being ~220 Elo weaker in play —
+  tactics suites measure sharpness, not strength).
+- v3 wall time: ~3.5 h of implement→race→bisect→revert loops, ≈ 25K
+  additional output tokens.

@@ -9,7 +9,11 @@ head-to-head numbers.
 
     go build -o chess chess.go
 
-(Any Go ≥ 1.21; no dependencies. Cross-compile: `GOOS=freebsd go build ...`)
+(Any Go ≥ 1.21; no dependencies.) `make` builds `chess-<os>` for the machine
+it runs on and `make all` cross-compiles the three binaries kept in the
+repository: `chess-freebsd`, `chess-linux` (both amd64) and `chess-macos`
+(arm64). `make test` runs the tests, `make install` copies the binary to
+`$(INSTALL_DIR)/chess`.
 
 ## Usage
 
@@ -18,12 +22,15 @@ head-to-head numbers.
     ./chess silentdemo [limit]   # same demo without boards (moves only)
     ./chess gui [limit]          # X11 board window (drag & drop), same engine
     ./chess gui demo [limit]     # X11 window, engine plays both sides
+    ./chess gui --icons --no-cpu [limit]   # piece icons, no CPU MOVE button
+    ./chess --help               # all options, with examples
 
 - The single optional argument is the computer's per-move limit — there is
   always **exactly one limiting resource per mode**:
   - **positive** = **TIME-limited**: max think seconds per move (wall clock,
-    enforced, checked every ~1024 nodes; also stops early when another full
-    iteration clearly would not fit). Depth and RAM are not limits here.
+    enforced, checked every ~1024 nodes). The whole time is used: a deeper
+    iteration cut off by the clock still counts when it has found a better
+    move. Fractions are accepted (`0.5`). Depth and RAM are not limits here.
     **Default when omitted: 600.**
   - **negative** = **DEPTH-limited**: fixed search depth (`-1` = depth 1,
     `-10` = depth 10); no clock, no RAM criterion.
@@ -39,13 +46,17 @@ head-to-head numbers.
   runtime memory limit (hash + 25% GC headroom) bounds transients; measured
   RSS stays flat for hours (sampled: no growth over long runs). Because the
   hash is sized from *available* (not total) RAM, even several instances
-  coexist safely.
+  coexist safely: `MemAvailable` on Linux, free + inactive memory on FreeBSD
+  and macOS (FreeBSD without swap: free memory only, the rest cannot be
+  reclaimed). In TIME mode the table is also no larger than the search can
+  fill within the limit: about 48 MB per thread and second.
 - Set `CHESS_VERBOSE=1` to print the chosen hash size, memory limit and
   thread count to stderr at startup.
 - The search runs in parallel on **all CPU cores** (Lazy SMP: every core
-  searches the same position with a shared transposition table; helpers start
-  one ply deeper). On an 8-core box expect roughly 3-6x more nodes searched
-  per second than single-threaded.
+  searches the same position with a shared transposition table; helpers
+  spread over the search depths). On an 8-core box expect roughly 6-7x more
+  nodes searched per second than single-threaded (`CHESS_THREADS=<n>` uses
+  fewer cores).
 - You play White and move first. Type moves in coordinate notation on stdin:
   `e2e4`, castling as the king move (`e1g1`), promotion with a suffix
   (`e7e8q`, `e7e8n`, ...). Uppercase input is accepted.
@@ -102,29 +113,41 @@ before. `CHESS_VERBOSE=1` still prints just the one startup line.
 
 ### GUI mode
 
-`./chess gui [limit]` opens a black-&-white X11 chessboard window (512x600).
+`./chess gui [limit]` opens a black-&-white X11 chessboard window (512x596).
 The limit argument and all engine behaviour are identical to text mode.
 
 - **No dependencies**: the program speaks the raw X11 wire protocol itself
-  over `$DISPLAY` (unix socket or TCP, `.Xauthority` MIT-MAGIC-COOKIE-1
-  supported) — still a single stdlib-only Go file. Works under a real X
-  server or headless `Xvfb`.
-- **Your move (White)**: drag a piece to its destination, or click the piece
-  then click the target square. Illegal moves are refused in the status bar
-  and the position is unchanged. Promotions pop up a Q/R/B/N chooser.
+  over `$DISPLAY` (unix socket, TCP or a socket path as XQuartz sets it;
+  `.Xauthority` MIT-MAGIC-COOKIE-1 supported) and paints the whole window
+  itself - board, pieces and text - so it needs no server fonts, images or
+  files: still a single stdlib-only Go file. Works under a real X server,
+  XQuartz or headless `Xvfb`.
+- **Your move (White)**: drag a piece and drop it on its destination, or
+  click the piece and then the target square. Illegal moves are refused in
+  the status bar and the position is unchanged. Promotions pop up a Q/R/B/N
+  chooser (a click outside it takes the move back).
+- **Changing your mind**: click the selected piece again, drop the piece
+  back on its own square (or outside the board), or click the right mouse
+  button - the selection is gone and another piece can be picked. Clicking
+  another piece of yours selects that one instead.
+- **`--icons`** (or `CHESS_ICONS=1`): piece icons instead of letters. They
+  are drawn by the program from geometric shapes, there are no image files.
+  Without it White pieces are letters on white badges, black pieces on black
+  badges (standard FEN letters).
 - **CPU MOVE button**: the engine picks and plays *your* move for you, then
-  answers normally — the GUI equivalent of the `c` command.
+  answers normally - the GUI equivalent of the `c` command. **`--no-cpu`**
+  (or `CHESS_NO_CPU=1`) hides it, so the human gets no engine help.
+- **`--input=click`** / **`--input=drag`** (or `CHESS_INPUT=...`) leave only
+  one of the two ways to move; the default `both` has them side by side.
 - The status bar shows whose turn it is, "check", thinking state and the
   final result (e.g. `1-0 checkmate`); the last move's squares are outlined.
 - stdout still carries the exact text-mode move protocol (`e2e4`, `check`,
   `1-0 checkmate`, ...), so you can log or pipe a GUI game just the same.
-- White pieces are letters on white badges, black pieces on black badges
-  (standard FEN letters); no images, fonts or files needed.
 - **`./chess gui demo [limit]`** combines both modes: the engine plays both
-  sides in the window (the CPU button disappears, the board ignores clicks),
-  the board animates move by move and stdout gets the usual move list.
-  `./chess gui demo 1` is a fast ~1 s/move show. Mode keywords may be given
-  in any order (`demo gui` works too).
+  sides in the window (no CPU button, the board ignores the mouse), the
+  board animates move by move and stdout gets the usual move list.
+  `./chess gui demo 1` is a fast ~1 s/move show. Mode keywords and options
+  may be given in any order (`demo gui` works too).
 
 ## Full rules implemented
 
@@ -138,6 +161,9 @@ Tournament-grade techniques, all in one file (validated feature-by-feature
 in head-to-head gauntlets — every addition had to beat the previous binary
 at real time controls or it was reverted):
 
+- **Board**: a mailbox plus incrementally maintained piece bitboards and
+  material/piece-square scores; move generation, attack detection, SEE and
+  the evaluation all run on the bitboards
 - **Search**: parallel Lazy SMP on **all CPU cores** sharing a lock-free
   XOR-validated, generation-aged, 2-way bucketed transposition table that
   also caches static evals (auto-sized from available RAM, see above);
@@ -148,14 +174,17 @@ at real time controls or it was reverted):
   extensions + multicut**; **probcut**; razoring; **reverse futility**,
   **futility**, **late-move** and **SEE pruning** (quiets and losing
   captures); internal iterative reduction; mate-distance pruning; check
-  extensions; in-search repetition and 50-move detection
+  extensions; in-search repetition, 50-move and insufficient-material
+  detection
 - **Quiescence**: transposition-table probing and storing, SEE (static
   exchange evaluation) pruning of losing captures, delta pruning, and full
   check-evasion search (no stand-pat in check — finds quiescence mates)
 - **Move ordering**: TT move → good captures by SEE + capture history →
   promotions → killer moves → countermove → quiet history (butterfly +
   two-ply **continuation history**, gravity-updated with penalties for
-  failed tries) → losing captures last
+  failed tries) → losing captures last; done in stages - the TT move is
+  tried before the others are scored, quiet moves are only sorted when
+  some of them will be searched
 - **Correction history**: a pawn-structure-keyed table learns the static
   eval's bias per structure during the search and corrects it on the fly
 - **Evaluation** (tapered mg/eg by game phase, bitboard-assisted): PeSTO
@@ -167,17 +196,26 @@ at real time controls or it was reverted):
   in a dedicated lock-free pawn hash table keyed by an incrementally
   maintained pawn zobrist); bishop pair; rooks on open and semi-open
   files; drawishness scaling (opposite-colored-bishop endings, pawnless
-  advantages); tempo
+  advantages); the right corner for the bishop-and-knight mate; tempo
 - No difficulty levels — always plays at full strength for the time given.
 
 ## Testing
+
+    make test        # or: go test chess.go chess_test.go; CHESS_SELFTEST=1 ./chess
+
+`chess_test.go` covers the GUI (mouse handling, rendering, options), the
+command line, the rules around repetition and en passant, the memory
+sizing, and - on a private `Xvfb`, skipped without one - the real program
+end to end: the test moves the X pointer (XTEST) and compares the window
+pixel by pixel, on 24-, 16- and 8-bit displays.
 
     CHESS_SELFTEST=1 ./chess
 
 runs a 13-case perft suite (start position d1–d5, Kiwipete d1–d4, and four
 more standard trap positions covering en passant, promotions, castling
-edge cases) with zobrist-hash **and pawn-key** consistency verified at every
-visited node. All cases pass. Also validated: exact `d` output format,
+edge cases) with zobrist-hash **and pawn-key** consistency, and the piece
+sets and incremental scores, verified at every visited node. All cases
+pass. Also validated: exact `d` output format,
 illegal-move rejection, wall-clock cap accuracy, multi-core scaling, full
 self-play demo games at fixed depth and timed modes, eval color-symmetry
 on mirrored positions, tactical spot checks (fool's mate, mate-in-1

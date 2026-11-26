@@ -135,3 +135,63 @@ Interesting engineering notes:
   tactics suites measure sharpness, not strength).
 - v3 wall time: ~3.5 h of implement→race→bisect→revert loops, ≈ 25K
   additional output tokens.
+
+## v4 — GUI rework, rules audit and a speed pass (2026-11-25/26)
+
+Model: Claude Fable 5.2 (claude-fable-5.2) via GitHub Copilot CLI, one night
+on the FreeBSD host. Request: fix the GUI (put a selected piece down again,
+piece icons, hide the CPU MOVE button, real drag & drop), check the
+gameplay, fix what is broken, make the engine stronger.
+
+Method: as in v3, with more games. A referee script (python-chess is the
+arbiter) plays the candidate against the previous accepted binary from 400
+random balanced openings, each one twice with the colors swapped, 1 thread
+and 64 MB hash each, 800 games per step at 0.1 s/move.
+
+| step | change | verdict @0.1 s/move |
+|---|---|---|
+| 1 | the same search, faster: packed moves, piece bitboards and material/piece-square sums kept incrementally, bitboard attacks, move generation (same move order), SEE (same choice of attackers) and evaluation (same values), per-ply move buffers | **+265 ± 25 Elo** (+568 =178 −54) over v3 |
+| 2 | the whole time limit is used and an iteration cut off by the clock counts when it has found a better move (v3 stopped at 55-100% of the limit and threw the unfinished iteration away); threefold-repetition fix | **+45 ± 19 Elo** (+290 =323 −187) over step 1 |
+| 3 | move ordering in stages (the hash move is tried before the others are scored, quiet moves are sorted only when some will be searched), insufficient material is a draw inside the search | **+30 ± 19 Elo** (+268 =332 −200) over step 2 |
+| 4 | Lazy SMP: a helper thread goes on to the next depth when half of the threads already search one (they used to search the same depths side by side); the right corner for the bishop-and-knight mate (six test endings now mate in 25-39 moves, none did) | time to depth 17 with 8 and with 16 threads: −17%; 300 games with 8 threads each at 0.2 s/move: +8 ± 26 Elo (+68 =171 −61) - not significant by itself, kept for the time to depth |
+
+Headline, final against v3 with one thread each:
+**400 games at 0.1 s/move: +319 =67 −14, 88.1%, +348 Elo [+307, +389]**, and
+on the Mac (M1, both built there; the build of step 3, whose one-thread
+search is the final one) **160 games at 1 s/move: +110 =47 −3, 83.4%,
++281 Elo [+231, +331]**. With 4 threads each (the binary in the repository)
+**200 games at 0.2 s/move: +161 =37 −2, 89.7%, +377 Elo [+319, +434]**.
+Nodes per second on the FreeBSD host (8 cores, 16 threads): 0.80M → 2.2M on
+one thread, 7.3M → 22.2M on all.
+
+How step 1 was checked: the search tree is the one of v3, node for node -
+a fixed-depth search of 8 positions visits 2,720,148 nodes at depth 12 and
+7,475,981 at depth 14 in both and plays the same moves - and a test ran the
+v3 functions next to the new ones on 446,121 positions of random games:
+evaluation, attacked squares, move lists (order included) and the SEE of
+10.2 million moves are equal. The staged ordering of step 3 gives the order
+of the old one-pass sort on 185,196 move lists with random history tables.
+
+What the audit found. The rules were tested against python-chess: 23,000
+self-play games from random positions, 6,000 games against a random "human"
+(legal moves, illegal ones and garbage) and 600 games played with the `c`
+command; every move, every `check` and every result line was compared.
+- Threefold repetition was declared late (4 of 23,000 games; none after the
+  fix): the en passant square went into the position hash after every
+  double pawn step, also when no capture was possible, so the first
+  occurrence of such a position did not count.
+- FreeBSD: the name of the "inactive memory" sysctl was misspelled, the
+  program silently took half of the physical RAM for available and sized
+  its hash table from that - 24.5 GB on a machine with 2 GB free.
+- The hash table is now also no larger than a timed search can fill.
+- GUI: the engine searched the very position the window was drawing (data
+  race), every mouse button and the wheel acted as a click, the socket-path
+  DISPLAY of XQuartz was not understood, a selected piece could not be put
+  down again.
+- Every hash store incremented one counter shared by all threads: 15% of
+  the nodes/s at 16 threads (20.3M → 23.3M).
+
+New in the repository: `chess_test.go` (GUI state machine, rendering,
+command line, rules, memory sizing, search and - on a private Xvfb with the
+real pointer - the program end to end on 24-, 16- and 8-bit displays) and a
+`Makefile`. Tests and binaries were run on FreeBSD, Linux and macOS.

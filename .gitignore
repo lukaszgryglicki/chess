@@ -2,6 +2,7 @@
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
+/chess
 *.exe
 *.exe~
 *.dll
@@ -31,3 +32,4 @@ go.work.sum
 # .idea/
 # .vscode/
 *.log
+*.secret

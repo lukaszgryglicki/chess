@@ -12,17 +12,19 @@
 //	limit < 0 : DEPTH-limited - fixed depth (-10 = depth 10); time and RAM
 //	            unlimited
 //	limit = 0 : RAM-limited - no clock, no depth cap; the hash table is
-//	            auto-sized to ~40% of available RAM (CHESS_HASH_MB env
+//	            auto-sized to ~80% of available RAM (CHESS_HASH_MB env
 //	            overrides) and the move is played once one full table's
 //	            worth of positions has been stored. More RAM = deeper.
 //
 // Memory can never OOM: all data is fixed-size + a Go runtime memory limit.
 // Searches in parallel on all CPU cores (Lazy SMP, shared lock-free TT).
 // Extra modes: "demo" = self-play with the board after every move,
-// "silentdemo" = the same without boards; VERBOSE=1 env = full search/
-// debug trace on stderr (zero overhead when off; stdout stays protocol).
+// "silentdemo" = the same without boards, "gui" = an X11 board window
+// (--help lists its options); VERBOSE=1 env = full search/debug trace on
+// stderr (zero overhead when off; stdout stays protocol).
 // Build: go build -o chess chess.go
 // Self-test (perft + zobrist): CHESS_SELFTEST=1 ./chess
+// Tests: go test chess.go chess_test.go
 package main
 
 import (
@@ -91,13 +93,20 @@ const (
 	MaxDepth = 64
 )
 
-type Move struct {
-	From, To int
-	Promo    int // 0 or WN..WQ magnitude (2..5)
-	Flags    int
+// Move packs from (6 bits), to (6), the promotion piece (4: 0 or WN..WQ)
+// and the flags (4), the layout the hash table stores.
+type Move uint32
+
+const NoMove Move = 0
+
+func mkMove(from, to, promo, flags int) Move {
+	return Move(from | to<<6 | promo<<12 | flags<<16)
 }
 
-var NoMove = Move{}
+func (m Move) From() int  { return int(m & 63) }
+func (m Move) To() int    { return int(m >> 6 & 63) }
+func (m Move) Promo() int { return int(m >> 12 & 15) }
+func (m Move) Flags() int { return int(m >> 16 & 15) }
 
 type Undo struct {
 	captured int
@@ -105,20 +114,67 @@ type Undo struct {
 	rights   int
 	ep       int
 	half     int
+	rev      int
 	hash     uint64
 	pawnKey  uint64
 }
 
 type Pos struct {
 	b       [64]int
+	bb      [2][7]uint64 // piece sets by color and type (WP..WK)
+	occ     [2]uint64    // all men of each color
 	side    int
 	rights  int
 	ep      int // -1 = none
 	half    int // halfmove clock
+	rev     int // positions in hist since the last irreversible move
+	mg, eg  int // material + piece-square score, White minus Black
+	phase   int // sum of phaseVal over all men
 	hash    uint64
 	pawnKey uint64
 	kingSq  [2]int
 	hist    []uint64 // hashes after every move (incl. start position)
+}
+
+// set puts piece pc on the empty square sq (board, piece sets and the
+// incremental evaluation terms); clr takes it off again.
+func (p *Pos) set(pc, sq int) {
+	c, t := White, pc
+	if pc < 0 {
+		c, t = Black, -pc
+	}
+	bit := uint64(1) << uint(sq)
+	p.b[sq] = pc
+	p.bb[c][t] |= bit
+	p.occ[c] |= bit
+	p.mg += pstMG[pc+6][sq]
+	p.eg += pstEG[pc+6][sq]
+	p.phase += phaseVal[t]
+}
+
+func (p *Pos) clr(pc, sq int) {
+	c, t := White, pc
+	if pc < 0 {
+		c, t = Black, -pc
+	}
+	bit := uint64(1) << uint(sq)
+	p.b[sq] = Empty
+	p.bb[c][t] &^= bit
+	p.occ[c] &^= bit
+	p.mg -= pstMG[pc+6][sq]
+	p.eg -= pstEG[pc+6][sq]
+	p.phase -= phaseVal[t]
+}
+
+// consistent reports whether the incremental state matches the board.
+func (p *Pos) consistent() bool {
+	var q Pos
+	for sq, pc := range p.b {
+		if pc != Empty {
+			q.set(pc, sq)
+		}
+	}
+	return q.bb == p.bb && q.occ == p.occ && q.mg == p.mg && q.eg == p.eg && q.phase == p.phase
 }
 
 // ---------- zobrist ----------
@@ -195,10 +251,10 @@ func startPos() *Pos {
 	p := &Pos{ep: -1, rights: CastleWK | CastleWQ | CastleBK | CastleBQ}
 	back := []int{WR, WN, WB, WQ, WK, WB, WN, WR}
 	for f := 0; f < 8; f++ {
-		p.b[f] = back[f]
-		p.b[8+f] = WP
-		p.b[48+f] = BP
-		p.b[56+f] = -back[f]
+		p.set(back[f], f)
+		p.set(WP, 8+f)
+		p.set(BP, 48+f)
+		p.set(-back[f], 56+f)
 	}
 	p.kingSq[White] = 4
 	p.kingSq[Black] = 60
@@ -213,84 +269,19 @@ func startPos() *Pos {
 
 var knightD = [8][2]int{{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}}
 var kingD = [8][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
-var rookD = [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
-var bishD = [4][2]int{{1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
 
 // attacked reports whether square sq is attacked by side "by".
 func (p *Pos) attacked(sq, by int) bool {
-	r, f := sq>>3, sq&7
-	if by == White {
-		if r > 0 {
-			if f > 0 && p.b[sq-9] == WP {
-				return true
-			}
-			if f < 7 && p.b[sq-7] == WP {
-				return true
-			}
-		}
-	} else {
-		if r < 7 {
-			if f > 0 && p.b[sq+7] == BP {
-				return true
-			}
-			if f < 7 && p.b[sq+9] == BP {
-				return true
-			}
-		}
+	bb := &p.bb[by]
+	if pawnAttBB[by^1][sq]&bb[WP] != 0 || knightBB[sq]&bb[WN] != 0 || kingBB[sq]&bb[WK] != 0 {
+		return true
 	}
-	kn, kg := WN, WK
-	if by == Black {
-		kn, kg = BN, BK
+	occ := p.occ[White] | p.occ[Black]
+	if d := bb[WB] | bb[WQ]; d&bishopMask[sq] != 0 && bishopAtt(sq, occ)&d != 0 {
+		return true
 	}
-	for _, d := range knightD {
-		nr, nf := r+d[0], f+d[1]
-		if nr >= 0 && nr < 8 && nf >= 0 && nf < 8 && p.b[nr*8+nf] == kn {
-			return true
-		}
-	}
-	for _, d := range kingD {
-		nr, nf := r+d[0], f+d[1]
-		if nr >= 0 && nr < 8 && nf >= 0 && nf < 8 && p.b[nr*8+nf] == kg {
-			return true
-		}
-	}
-	rq1, rq2 := WR, WQ
-	if by == Black {
-		rq1, rq2 = BR, BQ
-	}
-	for _, d := range rookD {
-		nr, nf := r+d[0], f+d[1]
-		for nr >= 0 && nr < 8 && nf >= 0 && nf < 8 {
-			pc := p.b[nr*8+nf]
-			if pc != Empty {
-				if pc == rq1 || pc == rq2 {
-					return true
-				}
-				break
-			}
-			nr += d[0]
-			nf += d[1]
-		}
-	}
-	bq1, bq2 := WB, WQ
-	if by == Black {
-		bq1, bq2 = BB, BQ
-	}
-	for _, d := range bishD {
-		nr, nf := r+d[0], f+d[1]
-		for nr >= 0 && nr < 8 && nf >= 0 && nf < 8 {
-			pc := p.b[nr*8+nf]
-			if pc != Empty {
-				if pc == bq1 || pc == bq2 {
-					return true
-				}
-				break
-			}
-			nr += d[0]
-			nf += d[1]
-		}
-	}
-	return false
+	l := bb[WR] | bb[WQ]
+	return l&rookMask[sq] != 0 && rookAtt(sq, occ)&l != 0
 }
 
 func (p *Pos) inCheck(side int) bool {
@@ -300,153 +291,163 @@ func (p *Pos) inCheck(side int) bool {
 // ---------- move generation (pseudo-legal) ----------
 
 func (p *Pos) genPseudo(capturesOnly bool) []Move {
-	moves := make([]Move, 0, 64)
-	us := p.side
-	own := func(pc int) bool {
-		if us == White {
-			return pc > 0
-		}
-		return pc < 0
-	}
-	enemy := func(pc int) bool {
-		if us == White {
-			return pc < 0
-		}
-		return pc > 0
-	}
-	addPromos := func(from, to, flags int) {
-		for _, pr := range []int{WQ, WR, WB, WN} {
-			moves = append(moves, Move{From: from, To: to, Promo: pr, Flags: flags})
-		}
-	}
+	return p.gen(make([]Move, 0, 64), capturesOnly)
+}
+
+// knightSeq and kingSeq list the squares a knight or king on sq can reach,
+// in the order of knightD and kingD.
+var knightSeq, kingSeq [64][]int8
+
+// rayUp tells whether direction d of rayBB runs towards higher squares.
+var rayUp = [8]bool{true, false, true, false, true, true, false, false}
+
+func init() {
 	for sq := 0; sq < 64; sq++ {
-		pc := p.b[sq]
-		if pc == Empty || !own(pc) {
-			continue
-		}
 		r, f := sq>>3, sq&7
+		for _, d := range knightD {
+			if nr, nf := r+d[0], f+d[1]; nr >= 0 && nr <= 7 && nf >= 0 && nf <= 7 {
+				knightSeq[sq] = append(knightSeq[sq], int8(nr*8+nf))
+			}
+		}
+		for _, d := range kingD {
+			if nr, nf := r+d[0], f+d[1]; nr >= 0 && nr <= 7 && nf >= 0 && nf <= 7 {
+				kingSeq[sq] = append(kingSeq[sq], int8(nr*8+nf))
+			}
+		}
+	}
+}
+
+// gen appends the pseudo-legal moves of the side to move to moves; with
+// capturesOnly just the captures and queen promotions. The order is fixed
+// (and part of the search): own men by square, each in its direction order.
+func (p *Pos) gen(moves []Move, capturesOnly bool) []Move {
+	us := p.side
+	enemy := p.occ[us^1]
+	occ := p.occ[us] | enemy
+	for own := p.occ[us]; own != 0; own &= own - 1 {
+		sq := bits.TrailingZeros64(own)
+		pc := p.b[sq]
+		if pc < 0 {
+			pc = -pc
+		}
 		switch pc {
-		case WP, BP:
+		case WP:
+			r, f := sq>>3, sq&7
 			dir, startR, promoR := 8, 1, 6
 			if us == Black {
 				dir, startR, promoR = -8, 6, 1
 			}
 			// pushes
-			to := sq + dir
-			if to >= 0 && to < 64 && p.b[to] == Empty {
+			if to := sq + dir; to >= 0 && to < 64 && occ>>uint(to)&1 == 0 {
 				if r == promoR {
 					if !capturesOnly {
-						addPromos(sq, to, 0)
+						moves = append(moves, mkMove(sq, to, WQ, 0), mkMove(sq, to, WR, 0),
+							mkMove(sq, to, WB, 0), mkMove(sq, to, WN, 0))
 					} else {
 						// queen promotion counts as a "loud" move in quiescence
-						moves = append(moves, Move{From: sq, To: to, Promo: WQ})
+						moves = append(moves, mkMove(sq, to, WQ, 0))
 					}
 				} else if !capturesOnly {
-					moves = append(moves, Move{From: sq, To: to})
-					if r == startR && p.b[sq+2*dir] == Empty {
-						moves = append(moves, Move{From: sq, To: sq + 2*dir, Flags: fDouble})
+					moves = append(moves, mkMove(sq, to, 0, 0))
+					if r == startR && occ>>uint(sq+2*dir)&1 == 0 {
+						moves = append(moves, mkMove(sq, sq+2*dir, 0, fDouble))
 					}
 				}
 			}
 			// captures
-			for _, df := range []int{-1, 1} {
-				nf := f + df
-				if nf < 0 || nf > 7 {
-					continue
-				}
+			for df := -1; df <= 1; df += 2 {
 				to := sq + dir + df
-				if to < 0 || to > 63 {
+				if f+df < 0 || f+df > 7 || to < 0 || to > 63 {
 					continue
 				}
-				if enemy(p.b[to]) {
+				if enemy>>uint(to)&1 != 0 {
 					if r == promoR {
-						addPromos(sq, to, fCapture)
+						moves = append(moves, mkMove(sq, to, WQ, fCapture), mkMove(sq, to, WR, fCapture),
+							mkMove(sq, to, WB, fCapture), mkMove(sq, to, WN, fCapture))
 					} else {
-						moves = append(moves, Move{From: sq, To: to, Flags: fCapture})
+						moves = append(moves, mkMove(sq, to, 0, fCapture))
 					}
 				} else if to == p.ep {
-					moves = append(moves, Move{From: sq, To: to, Flags: fCapture | fEP})
+					moves = append(moves, mkMove(sq, to, 0, fCapture|fEP))
 				}
 			}
-		case WN, BN:
-			for _, d := range knightD {
-				nr, nf := r+d[0], f+d[1]
-				if nr < 0 || nr > 7 || nf < 0 || nf > 7 {
-					continue
-				}
-				to := nr*8 + nf
-				if p.b[to] == Empty {
-					if !capturesOnly {
-						moves = append(moves, Move{From: sq, To: to})
+		case WN, WK:
+			seq, reach := knightSeq[sq], knightBB[sq]
+			if pc == WK {
+				seq, reach = kingSeq[sq], kingBB[sq]
+			}
+			if !capturesOnly || reach&enemy != 0 {
+				for _, t := range seq {
+					to := int(t)
+					if occ>>uint(to)&1 == 0 {
+						if !capturesOnly {
+							moves = append(moves, mkMove(sq, to, 0, 0))
+						}
+					} else if enemy>>uint(to)&1 != 0 {
+						moves = append(moves, mkMove(sq, to, 0, fCapture))
 					}
-				} else if enemy(p.b[to]) {
-					moves = append(moves, Move{From: sq, To: to, Flags: fCapture})
 				}
 			}
-		case WK, BK:
-			for _, d := range kingD {
-				nr, nf := r+d[0], f+d[1]
-				if nr < 0 || nr > 7 || nf < 0 || nf > 7 {
-					continue
-				}
-				to := nr*8 + nf
-				if p.b[to] == Empty {
-					if !capturesOnly {
-						moves = append(moves, Move{From: sq, To: to})
-					}
-				} else if enemy(p.b[to]) {
-					moves = append(moves, Move{From: sq, To: to, Flags: fCapture})
-				}
-			}
-			if capturesOnly {
+			if pc == WN || capturesOnly {
 				break
 			}
 			// castling (king not in check, path empty, transit squares safe)
 			if us == White && sq == 4 {
 				if p.rights&CastleWK != 0 && p.b[5] == Empty && p.b[6] == Empty &&
 					!p.attacked(4, Black) && !p.attacked(5, Black) && !p.attacked(6, Black) {
-					moves = append(moves, Move{From: 4, To: 6, Flags: fCastle})
+					moves = append(moves, mkMove(4, 6, 0, fCastle))
 				}
 				if p.rights&CastleWQ != 0 && p.b[3] == Empty && p.b[2] == Empty && p.b[1] == Empty &&
 					!p.attacked(4, Black) && !p.attacked(3, Black) && !p.attacked(2, Black) {
-					moves = append(moves, Move{From: 4, To: 2, Flags: fCastle})
+					moves = append(moves, mkMove(4, 2, 0, fCastle))
 				}
 			} else if us == Black && sq == 60 {
 				if p.rights&CastleBK != 0 && p.b[61] == Empty && p.b[62] == Empty &&
 					!p.attacked(60, White) && !p.attacked(61, White) && !p.attacked(62, White) {
-					moves = append(moves, Move{From: 60, To: 62, Flags: fCastle})
+					moves = append(moves, mkMove(60, 62, 0, fCastle))
 				}
 				if p.rights&CastleBQ != 0 && p.b[59] == Empty && p.b[58] == Empty && p.b[57] == Empty &&
 					!p.attacked(60, White) && !p.attacked(59, White) && !p.attacked(58, White) {
-					moves = append(moves, Move{From: 60, To: 58, Flags: fCastle})
+					moves = append(moves, mkMove(60, 58, 0, fCastle))
 				}
 			}
-		default: // sliders
-			var dirs [][2]int
-			switch pc {
-			case WR, BR:
-				dirs = rookD[:]
-			case WB, BB:
-				dirs = bishD[:]
-			case WQ, BQ:
-				dirs = append(rookD[:], bishD[:]...)
+		default: // sliders: rook rays 0..3, bishop rays 4..7, queen all
+			d0, d1 := 0, 8
+			if pc == WR {
+				d1 = 4
+			} else if pc == WB {
+				d0 = 4
 			}
-			for _, d := range dirs {
-				nr, nf := r+d[0], f+d[1]
-				for nr >= 0 && nr < 8 && nf >= 0 && nf < 8 {
-					to := nr*8 + nf
-					if p.b[to] == Empty {
-						if !capturesOnly {
-							moves = append(moves, Move{From: sq, To: to})
+			for d := d0; d < d1; d++ {
+				quiet := rayBB[d][sq]
+				blockers := quiet & occ
+				if blockers == 0 && capturesOnly {
+					continue
+				}
+				up, hit := rayUp[d], -1
+				if blockers != 0 {
+					if up {
+						hit = bits.TrailingZeros64(blockers)
+					} else {
+						hit = 63 - bits.LeadingZeros64(blockers)
+					}
+					quiet ^= rayBB[d][hit] | 1<<uint(hit)
+				}
+				if !capturesOnly { // outwards from the piece
+					if up {
+						for ; quiet != 0; quiet &= quiet - 1 {
+							moves = append(moves, mkMove(sq, bits.TrailingZeros64(quiet), 0, 0))
 						}
 					} else {
-						if enemy(p.b[to]) {
-							moves = append(moves, Move{From: sq, To: to, Flags: fCapture})
+						for quiet != 0 {
+							to := 63 - bits.LeadingZeros64(quiet)
+							quiet &^= 1 << uint(to)
+							moves = append(moves, mkMove(sq, to, 0, 0))
 						}
-						break
 					}
-					nr += d[0]
-					nf += d[1]
+				}
+				if hit >= 0 && enemy>>uint(hit)&1 != 0 {
+					moves = append(moves, mkMove(sq, hit, 0, fCapture))
 				}
 			}
 		}
@@ -456,86 +457,114 @@ func (p *Pos) genPseudo(capturesOnly bool) []Move {
 
 // ---------- make / unmake ----------
 
+// epLegal reports whether side by can legally capture en passant on square
+// ep, the pawn that just made a double step standing behind it. Only then
+// is ep part of the position (its hash, so threefold repetition, and the
+// move generation), as the rules of chess have it.
+func (p *Pos) epLegal(ep, by int) bool {
+	victim := ep + 8
+	if by == White {
+		victim = ep - 8
+	}
+	them := &p.bb[by^1]
+	k := p.kingSq[by]
+	all := p.occ[White] | p.occ[Black]
+	for from := pawnAttBB[by^1][ep] & p.bb[by][WP]; from != 0; from &= from - 1 {
+		occ := all&^(from&-from|1<<uint(victim)) | 1<<uint(ep)
+		if pawnAttBB[by][k]&them[WP]&^(1<<uint(victim)) == 0 && knightBB[k]&them[WN] == 0 &&
+			kingBB[k]&them[WK] == 0 && bishopAtt(k, occ)&(them[WB]|them[WQ]) == 0 &&
+			rookAtt(k, occ)&(them[WR]|them[WQ]) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// castleRook gives the rook's squares for a castling king arriving on to.
+func castleRook(to int) (from, dest int) {
+	switch to {
+	case 6:
+		return 7, 5
+	case 2:
+		return 0, 3
+	case 62:
+		return 63, 61
+	}
+	return 56, 59
+}
+
 func (p *Pos) make(m Move) Undo {
-	u := Undo{captured: Empty, capSq: m.To, rights: p.rights, ep: p.ep, half: p.half, hash: p.hash, pawnKey: p.pawnKey}
-	pc := p.b[m.From]
+	from, to := m.From(), m.To()
+	u := Undo{captured: Empty, capSq: to, rights: p.rights, ep: p.ep, half: p.half, rev: p.rev,
+		hash: p.hash, pawnKey: p.pawnKey}
+	pc := p.b[from]
 	mover := p.side
-	if m.Flags&fEP != 0 {
+	if m.Flags()&fEP != 0 {
 		if mover == White {
-			u.capSq = m.To - 8
+			u.capSq = to - 8
 		} else {
-			u.capSq = m.To + 8
+			u.capSq = to + 8
 		}
 		u.captured = p.b[u.capSq]
 		p.hash ^= zPiece[pidx(u.captured)][u.capSq]
 		p.pawnKey ^= zPiece[pidx(u.captured)][u.capSq] // EP victim is a pawn
-		p.b[u.capSq] = Empty
-	} else if p.b[m.To] != Empty {
-		u.captured = p.b[m.To]
-		p.hash ^= zPiece[pidx(u.captured)][m.To]
+		p.clr(u.captured, u.capSq)
+	} else if p.b[to] != Empty {
+		u.captured = p.b[to]
+		p.hash ^= zPiece[pidx(u.captured)][to]
 		if u.captured == WP || u.captured == BP {
-			p.pawnKey ^= zPiece[pidx(u.captured)][m.To]
+			p.pawnKey ^= zPiece[pidx(u.captured)][to]
 		}
+		p.clr(u.captured, to)
 	}
-	p.hash ^= zPiece[pidx(pc)][m.From]
+	p.hash ^= zPiece[pidx(pc)][from]
 	if pc == WP || pc == BP {
-		p.pawnKey ^= zPiece[pidx(pc)][m.From]
+		p.pawnKey ^= zPiece[pidx(pc)][from]
 	}
-	p.b[m.From] = Empty
+	p.clr(pc, from)
 	np := pc
-	if m.Promo != 0 {
+	if promo := m.Promo(); promo != 0 {
 		if mover == White {
-			np = m.Promo
+			np = promo
 		} else {
-			np = -m.Promo
+			np = -promo
 		}
 	}
-	p.b[m.To] = np
-	p.hash ^= zPiece[pidx(np)][m.To]
+	p.set(np, to)
+	p.hash ^= zPiece[pidx(np)][to]
 	if np == WP || np == BP {
-		p.pawnKey ^= zPiece[pidx(np)][m.To]
+		p.pawnKey ^= zPiece[pidx(np)][to]
 	}
-	if m.Flags&fCastle != 0 {
-		var rf, rt int
-		switch m.To {
-		case 6:
-			rf, rt = 7, 5
-		case 2:
-			rf, rt = 0, 3
-		case 62:
-			rf, rt = 63, 61
-		case 58:
-			rf, rt = 56, 59
-		}
+	if m.Flags()&fCastle != 0 {
+		rf, rt := castleRook(to)
 		rk := p.b[rf]
 		p.hash ^= zPiece[pidx(rk)][rf] ^ zPiece[pidx(rk)][rt]
-		p.b[rf] = Empty
-		p.b[rt] = rk
+		p.clr(rk, rf)
+		p.set(rk, rt)
 	}
 	if pc == WK {
-		p.kingSq[White] = m.To
+		p.kingSq[White] = to
 	} else if pc == BK {
-		p.kingSq[Black] = m.To
+		p.kingSq[Black] = to
 	}
 	p.hash ^= zCastle[p.rights]
-	p.rights &= castleMask[m.From] & castleMask[m.To]
+	p.rights &= castleMask[from] & castleMask[to]
 	p.hash ^= zCastle[p.rights]
 	if p.ep >= 0 {
 		p.hash ^= zEP[p.ep&7]
 	}
 	p.ep = -1
-	if m.Flags&fDouble != 0 {
-		if mover == White {
-			p.ep = m.From + 8
-		} else {
-			p.ep = m.From - 8
+	if m.Flags()&fDouble != 0 {
+		if ep := (from + to) / 2; p.epLegal(ep, mover^1) {
+			p.ep = ep
+			p.hash ^= zEP[ep&7]
 		}
-		p.hash ^= zEP[p.ep&7]
 	}
 	if pc == WP || pc == BP || u.captured != Empty {
-		p.half = 0
+		p.half, p.rev = 0, 0
 	} else {
 		p.half++
+		p.rev++
 	}
 	p.side ^= 1
 	p.hash ^= zSide
@@ -547,43 +576,36 @@ func (p *Pos) unmake(m Move, u Undo) {
 	p.hist = p.hist[:len(p.hist)-1]
 	p.side ^= 1
 	mover := p.side
-	pc := p.b[m.To]
-	if m.Promo != 0 {
+	from, to := m.From(), m.To()
+	np := p.b[to]
+	pc := np
+	if m.Promo() != 0 {
 		if mover == White {
 			pc = WP
 		} else {
 			pc = BP
 		}
 	}
-	p.b[m.From] = pc
-	p.b[m.To] = Empty
+	p.clr(np, to)
+	p.set(pc, from)
 	if u.captured != Empty {
-		p.b[u.capSq] = u.captured
+		p.set(u.captured, u.capSq)
 	}
-	if m.Flags&fCastle != 0 {
-		switch m.To {
-		case 6:
-			p.b[7] = p.b[5]
-			p.b[5] = Empty
-		case 2:
-			p.b[0] = p.b[3]
-			p.b[3] = Empty
-		case 62:
-			p.b[63] = p.b[61]
-			p.b[61] = Empty
-		case 58:
-			p.b[56] = p.b[59]
-			p.b[59] = Empty
-		}
+	if m.Flags()&fCastle != 0 {
+		rf, rt := castleRook(to)
+		rk := p.b[rt]
+		p.clr(rk, rt)
+		p.set(rk, rf)
 	}
 	if pc == WK {
-		p.kingSq[White] = m.From
+		p.kingSq[White] = from
 	} else if pc == BK {
-		p.kingSq[Black] = m.From
+		p.kingSq[Black] = from
 	}
 	p.rights = u.rights
 	p.ep = u.ep
 	p.half = u.half
+	p.rev = u.rev
 	p.hash = u.hash
 	p.pawnKey = u.pawnKey
 }
@@ -741,6 +763,21 @@ var egPST = [7]*[64]int{nil, &egPawnT, &egKnightT, &egBishopT, &egRookT, &egQuee
 
 var phaseVal = [7]int{0, 0, 1, 1, 2, 4, 0}
 
+// material + piece-square value of every piece (index pc+6) on every
+// square, White positive and Black negative: Pos keeps their sums.
+var pstMG, pstEG [13][64]int
+
+func init() {
+	for t := WP; t <= WK; t++ {
+		for sq := 0; sq < 64; sq++ {
+			pstMG[6+t][sq] = mgVal[t] + mgPST[t][sq^56]
+			pstEG[6+t][sq] = egVal[t] + egPST[t][sq^56]
+			pstMG[6-t][sq] = -mgVal[t] - mgPST[t][sq]
+			pstEG[6-t][sq] = -egVal[t] - egPST[t][sq]
+		}
+	}
+}
+
 // passed pawn bonus by relative rank (0 = own back rank)
 var passedMG = [8]int{0, 4, 9, 15, 30, 60, 100, 0}
 var passedEG = [8]int{0, 14, 24, 40, 70, 125, 195, 0}
@@ -751,17 +788,34 @@ var passedEG = [8]int{0, 14, 24, 40, 70, 125, 195, 0}
 // ---------- evaluation: bitboard-assisted (mobility, king safety, threats) ----------
 
 const (
-	fileABB = uint64(0x0101010101010101)
-	fileHBB = uint64(0x8080808080808080)
+	fileABB      = uint64(0x0101010101010101)
+	fileHBB      = uint64(0x8080808080808080)
+	lightSquares = uint64(0x55AA55AA55AA55AA)
 )
 
 var queenD = [8][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
 
 var knightBB, kingBB [64]uint64
 
+// rayBB[d][sq] are the squares from sq to the edge in direction d, in the
+// order of queenD (rook lines, then diagonals): 0 N, 1 S, 2 E, 3 W, 4 NE,
+// 5 NW, 6 SE, 7 SW; 0, 2, 4 and 5 run towards higher square numbers.
+var rayBB [8][64]uint64
+var rookMask, bishopMask [64]uint64 // attacks on an empty board
+var pawnAttBB [2][64]uint64         // squares a pawn of that color on sq attacks
+
 func init() {
 	for sq := 0; sq < 64; sq++ {
 		f, r := sq&7, sq>>3
+		for d, dd := range queenD {
+			for nr, nf := r+dd[0], f+dd[1]; nr >= 0 && nr < 8 && nf >= 0 && nf < 8; nr, nf = nr+dd[0], nf+dd[1] {
+				rayBB[d][sq] |= 1 << uint(nr*8+nf)
+			}
+		}
+		rookMask[sq] = rayBB[0][sq] | rayBB[1][sq] | rayBB[2][sq] | rayBB[3][sq]
+		bishopMask[sq] = rayBB[4][sq] | rayBB[5][sq] | rayBB[6][sq] | rayBB[7][sq]
+		pawnAttBB[White][sq] = pawnAttWBB(1 << uint(sq))
+		pawnAttBB[Black][sq] = pawnAttBBB(1 << uint(sq))
 		for _, d := range knightD {
 			if nf, nr := f+d[0], r+d[1]; nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
 				knightBB[sq] |= 1 << uint(nr*8+nf)
@@ -778,23 +832,40 @@ func init() {
 func pawnAttWBB(bb uint64) uint64 { return (bb&^fileABB)<<7 | (bb&^fileHBB)<<9 }
 func pawnAttBBB(bb uint64) uint64 { return (bb&^fileABB)>>9 | (bb&^fileHBB)>>7 }
 
-// rayAttBB returns sliding attacks from sq over occupancy occ.
-func rayAttBB(sq int, occ uint64, dirs [][2]int) uint64 {
-	var att uint64
-	f0, r0 := sq&7, sq>>3
-	for _, d := range dirs {
-		f, r := f0+d[0], r0+d[1]
-		for f >= 0 && f < 8 && r >= 0 && r < 8 {
-			b := uint64(1) << uint(r*8+f)
-			att |= b
-			if occ&b != 0 {
-				break
-			}
-			f += d[0]
-			r += d[1]
-		}
+// rookAtt and bishopAtt are the squares a rook or a bishop on sq attacks
+// with the men of occ on the board (the first man on each ray included).
+func rookAtt(sq int, occ uint64) uint64 {
+	n, s, e, w := rayBB[0][sq], rayBB[1][sq], rayBB[2][sq], rayBB[3][sq]
+	if b := n & occ; b != 0 {
+		n ^= rayBB[0][bits.TrailingZeros64(b)]
 	}
-	return att
+	if b := s & occ; b != 0 {
+		s ^= rayBB[1][63-bits.LeadingZeros64(b)]
+	}
+	if b := e & occ; b != 0 {
+		e ^= rayBB[2][bits.TrailingZeros64(b)]
+	}
+	if b := w & occ; b != 0 {
+		w ^= rayBB[3][63-bits.LeadingZeros64(b)]
+	}
+	return n | s | e | w
+}
+
+func bishopAtt(sq int, occ uint64) uint64 {
+	ne, nw, se, sw := rayBB[4][sq], rayBB[5][sq], rayBB[6][sq], rayBB[7][sq]
+	if b := ne & occ; b != 0 {
+		ne ^= rayBB[4][bits.TrailingZeros64(b)]
+	}
+	if b := nw & occ; b != 0 {
+		nw ^= rayBB[5][bits.TrailingZeros64(b)]
+	}
+	if b := se & occ; b != 0 {
+		se ^= rayBB[6][63-bits.LeadingZeros64(b)]
+	}
+	if b := sw & occ; b != 0 {
+		sw ^= rayBB[7][63-bits.LeadingZeros64(b)]
+	}
+	return ne | nw | se | sw
 }
 
 func chebDist(a, b int) int {
@@ -820,6 +891,26 @@ var mobQ = [28]int{-20, -12, -6, -2, 2, 5, 8, 11, 13, 15, 17, 19, 21, 23, 25, 26
 
 // connected pawns bonus by rank (white perspective)
 var connPawn = [8]int{0, 3, 5, 8, 14, 24, 40, 0}
+
+// passedMask[c][sq]: where an enemy pawn stops the pawn of color c on sq
+// from being passed (its own and the adjacent files, ahead of it).
+var passedMask [2][64]uint64
+
+func init() {
+	for sq := 0; sq < 64; sq++ {
+		f, r := sq&7, sq>>3
+		files := fileABB << uint(f)
+		if f > 0 {
+			files |= fileABB << uint(f-1)
+		}
+		if f < 7 {
+			files |= fileABB << uint(f+1)
+		}
+		below := uint64(1)<<uint(8*r) - 1
+		passedMask[White][sq] = files &^ (below | 0xFF<<uint(8*r))
+		passedMask[Black][sq] = files & below
+	}
+}
 
 // pawn-structure cache: lock-free, XOR-validated (key ^ data)
 const pawnTTBits = 20
@@ -904,66 +995,23 @@ func pawnStructure(wp, bp uint64) (mg, eg int) {
 	return
 }
 
-func (p *Pos) eval() int {
-	var mg, eg, phase int
-	var wp, bp, wOcc, bOcc uint64
-	var wpF, bpF [10]uint16 // pawn rank-bitmask per file (index = file+1)
-	// piece lists (squares) per side for N,B,R,Q
-	var wN, wB, wR, wQ, bN, bB, bR, bQ [10]int
-	var nwN, nwB, nwR, nwQ, nbN, nbB, nbR, nbQ int
-	for sq := 0; sq < 64; sq++ {
-		pc := p.b[sq]
-		if pc == Empty {
-			continue
-		}
-		bit := uint64(1) << uint(sq)
-		if pc > 0 {
-			wOcc |= bit
-			phase += phaseVal[pc]
-			mg += mgVal[pc] + mgPST[pc][sq^56]
-			eg += egVal[pc] + egPST[pc][sq^56]
-			switch pc {
-			case WP:
-				wp |= bit
-				wpF[sq&7+1] |= 1 << uint(sq>>3)
-			case WN:
-				wN[nwN] = sq
-				nwN++
-			case WB:
-				wB[nwB] = sq
-				nwB++
-			case WR:
-				wR[nwR] = sq
-				nwR++
-			case WQ:
-				wQ[nwQ] = sq
-				nwQ++
-			}
-		} else {
-			bOcc |= bit
-			q := -pc
-			phase += phaseVal[q]
-			mg -= mgVal[q] + mgPST[q][sq]
-			eg -= egVal[q] + egPST[q][sq]
-			switch q {
-			case WP:
-				bp |= bit
-				bpF[sq&7+1] |= 1 << uint(sq>>3)
-			case WN:
-				bN[nbN] = sq
-				nbN++
-			case WB:
-				bB[nbB] = sq
-				nbB++
-			case WR:
-				bR[nbR] = sq
-				nbR++
-			case WQ:
-				bQ[nbQ] = sq
-				nbQ++
-			}
-		}
+// kbnk is the bonus for driving the bare king (on lone) into a corner of
+// the bishop's color with the own king close by: bishop and knight can
+// mate nowhere else.
+func kbnk(bishop uint64, lone, king int) int {
+	f, r := lone&7, lone>>3
+	d := min(f+r, 14-f-r) // steps to a1 or h8, the dark corners
+	if bishop&lightSquares != 0 {
+		d = min(7-f+r, f+7-r) // to h1 or a8
 	}
+	return 40*(7-d) + 10*(7-chebDist(lone, king))
+}
+
+func (p *Pos) eval() int {
+	mg, eg, phase := p.mg, p.eg, p.phase // material + piece-square tables
+	w, b := &p.bb[White], &p.bb[Black]
+	wp, bp := w[WP], b[WP]
+	wOcc, bOcc := p.occ[White], p.occ[Black]
 	occ := wOcc | bOcc
 	// pawn structure (cached)
 	if wp|bp != 0 {
@@ -992,8 +1040,8 @@ func (p *Pos) eval() int {
 	wAtt, bAtt := wPawnAtt|kingBB[wk], bPawnAtt|kingBB[bk]
 	wUnits, wAttackers, bUnits, bAttackers := 0, 0, 0, 0 // attacks on ENEMY king
 	// white pieces
-	for i := 0; i < nwN; i++ {
-		a := knightBB[wN[i]]
+	for x := w[WN]; x != 0; x &= x - 1 {
+		a := knightBB[bits.TrailingZeros64(x)]
 		wAtt |= a
 		c := bits.OnesCount64(a & wMobArea)
 		mg += mobN[c]
@@ -1003,8 +1051,8 @@ func (p *Pos) eval() int {
 			wAttackers++
 		}
 	}
-	for i := 0; i < nwB; i++ {
-		a := rayAttBB(wB[i], occ&^(1<<uint(wB[i])), bishD[:])
+	for x := w[WB]; x != 0; x &= x - 1 {
+		a := bishopAtt(bits.TrailingZeros64(x), occ)
 		wAtt |= a
 		c := bits.OnesCount64(a & wMobArea)
 		if c > 13 {
@@ -1017,9 +1065,9 @@ func (p *Pos) eval() int {
 			wAttackers++
 		}
 	}
-	for i := 0; i < nwR; i++ {
-		sq := wR[i]
-		a := rayAttBB(sq, occ&^(1<<uint(sq)), rookD[:])
+	for x := w[WR]; x != 0; x &= x - 1 {
+		sq := bits.TrailingZeros64(x)
+		a := rookAtt(sq, occ)
 		wAtt |= a
 		c := bits.OnesCount64(a & wMobArea)
 		if c > 14 {
@@ -1031,9 +1079,8 @@ func (p *Pos) eval() int {
 			wUnits += 3 * bits.OnesCount64(t)
 			wAttackers++
 		}
-		f := sq & 7
-		if wpF[f+1] == 0 { // (semi-)open file
-			if bpF[f+1] == 0 {
+		if file := fileABB << uint(sq&7); wp&file == 0 { // (semi-)open file
+			if bp&file == 0 {
 				mg += 25
 				eg += 12
 			} else {
@@ -1042,8 +1089,9 @@ func (p *Pos) eval() int {
 			}
 		}
 	}
-	for i := 0; i < nwQ; i++ {
-		a := rayAttBB(wQ[i], occ&^(1<<uint(wQ[i])), queenD[:])
+	for x := w[WQ]; x != 0; x &= x - 1 {
+		sq := bits.TrailingZeros64(x)
+		a := rookAtt(sq, occ) | bishopAtt(sq, occ)
 		wAtt |= a
 		c := bits.OnesCount64(a & wMobArea)
 		if c > 27 {
@@ -1057,8 +1105,8 @@ func (p *Pos) eval() int {
 		}
 	}
 	// black pieces
-	for i := 0; i < nbN; i++ {
-		a := knightBB[bN[i]]
+	for x := b[WN]; x != 0; x &= x - 1 {
+		a := knightBB[bits.TrailingZeros64(x)]
 		bAtt |= a
 		c := bits.OnesCount64(a & bMobArea)
 		mg -= mobN[c]
@@ -1068,8 +1116,8 @@ func (p *Pos) eval() int {
 			bAttackers++
 		}
 	}
-	for i := 0; i < nbB; i++ {
-		a := rayAttBB(bB[i], occ&^(1<<uint(bB[i])), bishD[:])
+	for x := b[WB]; x != 0; x &= x - 1 {
+		a := bishopAtt(bits.TrailingZeros64(x), occ)
 		bAtt |= a
 		c := bits.OnesCount64(a & bMobArea)
 		if c > 13 {
@@ -1082,9 +1130,9 @@ func (p *Pos) eval() int {
 			bAttackers++
 		}
 	}
-	for i := 0; i < nbR; i++ {
-		sq := bR[i]
-		a := rayAttBB(sq, occ&^(1<<uint(sq)), rookD[:])
+	for x := b[WR]; x != 0; x &= x - 1 {
+		sq := bits.TrailingZeros64(x)
+		a := rookAtt(sq, occ)
 		bAtt |= a
 		c := bits.OnesCount64(a & bMobArea)
 		if c > 14 {
@@ -1096,9 +1144,8 @@ func (p *Pos) eval() int {
 			bUnits += 3 * bits.OnesCount64(t)
 			bAttackers++
 		}
-		f := sq & 7
-		if bpF[f+1] == 0 {
-			if wpF[f+1] == 0 {
+		if file := fileABB << uint(sq&7); bp&file == 0 {
+			if wp&file == 0 {
 				mg -= 25
 				eg -= 12
 			} else {
@@ -1107,8 +1154,9 @@ func (p *Pos) eval() int {
 			}
 		}
 	}
-	for i := 0; i < nbQ; i++ {
-		a := rayAttBB(bQ[i], occ&^(1<<uint(bQ[i])), queenD[:])
+	for x := b[WQ]; x != 0; x &= x - 1 {
+		sq := bits.TrailingZeros64(x)
+		a := rookAtt(sq, occ) | bishopAtt(sq, occ)
 		bAtt |= a
 		c := bits.OnesCount64(a & bMobArea)
 		if c > 27 {
@@ -1123,7 +1171,7 @@ func (p *Pos) eval() int {
 	}
 	// king safety: weighted attack units on the enemy king ring
 	// (needs at least two attacking pieces and the queen still on the board)
-	if wAttackers >= 2 && nwQ > 0 {
+	if wAttackers >= 2 && w[WQ] != 0 {
 		u := wUnits * wUnits / 6
 		if u > 450 {
 			u = 450
@@ -1131,7 +1179,7 @@ func (p *Pos) eval() int {
 		mg += u
 		eg += u / 4
 	}
-	if bAttackers >= 2 && nbQ > 0 {
+	if bAttackers >= 2 && b[WQ] != 0 {
 		u := bUnits * bUnits / 6
 		if u > 450 {
 			u = 450
@@ -1163,11 +1211,10 @@ func (p *Pos) eval() int {
 		eg -= 12 * n
 	}
 	// passed-pawn extras: blockade and king proximity (endgame)
-	for bb := wp; bb != 0; bb &= bb - 1 {
-		sq := bits.TrailingZeros64(bb)
-		f, r := sq&7, sq>>3
-		if (bpF[f]|bpF[f+1]|bpF[f+2])&(^uint16(0)<<uint(r+1)) == 0 {
-			stop := sq + 8
+	for x := wp; x != 0; x &= x - 1 {
+		sq := bits.TrailingZeros64(x)
+		if bp&passedMask[White][sq] == 0 {
+			r, stop := sq>>3, sq+8
 			if occ&(1<<uint(stop)) != 0 {
 				mg -= 8
 				eg -= passedEG[r] / 3
@@ -1175,12 +1222,10 @@ func (p *Pos) eval() int {
 			eg += 6*chebDist(bk, stop)*r/4 - 3*chebDist(wk, stop)*r/4
 		}
 	}
-	for bb := bp; bb != 0; bb &= bb - 1 {
-		sq := bits.TrailingZeros64(bb)
-		f, r := sq&7, sq>>3
-		if (wpF[f]|wpF[f+1]|wpF[f+2])&((1<<uint(r))-1) == 0 {
-			rr := 7 - r
-			stop := sq - 8
+	for x := bp; x != 0; x &= x - 1 {
+		sq := bits.TrailingZeros64(x)
+		if wp&passedMask[Black][sq] == 0 {
+			rr, stop := 7-sq>>3, sq-8
 			if occ&(1<<uint(stop)) != 0 {
 				mg += 8
 				eg += passedEG[rr] / 3
@@ -1189,41 +1234,39 @@ func (p *Pos) eval() int {
 		}
 	}
 	// bishop pair
-	if nwB >= 2 {
+	if w[WB]&(w[WB]-1) != 0 {
 		mg += 24
 		eg += 45
 	}
-	if nbB >= 2 {
+	if b[WB]&(b[WB]-1) != 0 {
 		mg -= 24
 		eg -= 45
 	}
 	// king pawn shield (middlegame): own pawns 1-2 ranks ahead of the king
 	if kf, kr := wk&7, wk>>3; kr <= 1 {
-		for i := kf; i <= kf+2; i++ {
-			if i == 0 || i == 9 {
-				continue
-			}
-			if wpF[i]&(6<<uint(kr)) != 0 {
+		near := uint64(0xFFFF) << uint(8*(kr+1))
+		for f := max(kf-1, 0); f <= min(kf+1, 7); f++ {
+			file := fileABB << uint(f)
+			if wp&file&near != 0 {
 				mg += 8
 			} else {
 				mg -= 14
 			}
-			if wpF[i] == 0 && bpF[i] == 0 {
+			if (wp|bp)&file == 0 {
 				mg -= 10
 			}
 		}
 	}
 	if kf, kr := bk&7, bk>>3; kr >= 6 {
-		for i := kf; i <= kf+2; i++ {
-			if i == 0 || i == 9 {
-				continue
-			}
-			if bpF[i]&(3<<uint(kr-2)) != 0 {
+		near := uint64(0xFFFF) << uint(8*(kr-2))
+		for f := max(kf-1, 0); f <= min(kf+1, 7); f++ {
+			file := fileABB << uint(f)
+			if bp&file&near != 0 {
 				mg -= 8
 			} else {
 				mg += 14
 			}
-			if wpF[i] == 0 && bpF[i] == 0 {
+			if (wp|bp)&file == 0 {
 				mg += 10
 			}
 		}
@@ -1232,18 +1275,23 @@ func (p *Pos) eval() int {
 		phase = 24
 	}
 	score := (mg*phase + eg*(24-phase)) / 24
+	if phase == 2 && wp|bp == 0 { // bishop and knight against the bare king
+		if w[WB] != 0 && w[WN] != 0 && bOcc == b[WK] {
+			score += kbnk(w[WB], bk, wk)
+		} else if b[WB] != 0 && b[WN] != 0 && wOcc == w[WK] {
+			score -= kbnk(b[WB], wk, bk)
+		}
+	}
 	// scale down drawish endgames
 	if phase <= 8 {
 		strongerPawns := wp
 		if score < 0 {
 			strongerPawns = bp
 		}
-		if nwB == 1 && nbB == 1 && nwN+nbN+nwR+nbR+nwQ+nbQ == 0 {
+		if bits.OnesCount64(w[WB]) == 1 && bits.OnesCount64(b[WB]) == 1 &&
+			w[WN]|w[WR]|w[WQ]|b[WN]|b[WR]|b[WQ] == 0 {
 			// opposite-colored bishops: strong draw tendency
-			light := uint64(0x55AA55AA55AA55AA)
-			wLight := light>>uint(wB[0])&1 != 0
-			bLight := light>>uint(bB[0])&1 != 0
-			if wLight != bLight {
+			if (w[WB]&lightSquares != 0) != (b[WB]&lightSquares != 0) {
 				score = score * 55 / 100
 			}
 		}
@@ -1259,19 +1307,8 @@ func (p *Pos) eval() int {
 
 // non-pawn material present for the side to move (null-move guard)
 func (p *Pos) hasNonPawnMaterial() bool {
-	for sq := 0; sq < 64; sq++ {
-		pc := p.b[sq]
-		if pc == Empty {
-			continue
-		}
-		if p.side == White && pc > WP && pc < WK {
-			return true
-		}
-		if p.side == Black && pc < BP && pc > BK {
-			return true
-		}
-	}
-	return false
+	bb := &p.bb[p.side]
+	return bb[WN]|bb[WB]|bb[WR]|bb[WQ] != 0
 }
 
 // ---------- transposition table (lock-free, XOR-validated) ----------
@@ -1303,6 +1340,48 @@ var ttSize uint64 // entries, always a power of two
 var ttTable []ttEntry
 var ttGen atomic.Uint32 // bumped once per bestMove call, 6-bit wrap
 
+// uints parses numbers separated by white space (a final dot is ignored);
+// nil when one of them is not a number.
+func uints(s string) (v []uint64) {
+	for _, f := range strings.Fields(s) {
+		n, err := strconv.ParseUint(strings.TrimSuffix(f, "."), 10, 64)
+		if err != nil {
+			return nil
+		}
+		v = append(v, n)
+	}
+	return v
+}
+
+// freeBSDAvail counts the free pages, and the inactive ones only when there
+// is swap to move them to: without swap they cannot be reclaimed.
+func freeBSDAvail(pageSize, free, inactive, swap uint64) uint64 {
+	if swap > 0 {
+		free += inactive
+	}
+	return free * pageSize
+}
+
+// vmStatAvail reads the output of the macOS vm_stat command: the free,
+// inactive, speculative and purgeable pages.
+func vmStatAvail(out string) uint64 {
+	var pageSize, pages uint64
+	for _, ln := range strings.Split(out, "\n") {
+		if _, rest, ok := strings.Cut(ln, "page size of "); ok {
+			if v := uints(strings.TrimSuffix(rest, " bytes)")); len(v) == 1 {
+				pageSize = v[0]
+			}
+		}
+		switch name, val, _ := strings.Cut(ln, ":"); name {
+		case "Pages free", "Pages inactive", "Pages speculative", "Pages purgeable":
+			if v := uints(val); len(v) == 1 {
+				pages += v[0]
+			}
+		}
+	}
+	return pageSize * pages
+}
+
 // availableRAM estimates currently available memory in bytes.
 func availableRAM() uint64 {
 	// Linux
@@ -1317,16 +1396,17 @@ func availableRAM() uint64 {
 			}
 		}
 	}
-	// FreeBSD (and similar): free + inactive pages
-	if out, err := exec.Command("sysctl", "-n", "hw.pagesize",
-		"vm.stats.vm.v_free_count", "vm.stats.vm.v_inact_count").Output(); err == nil {
-		if f := strings.Fields(string(out)); len(f) == 3 {
-			ps, e1 := strconv.ParseUint(f[0], 10, 64)
-			fr, e2 := strconv.ParseUint(f[1], 10, 64)
-			in, e3 := strconv.ParseUint(f[2], 10, 64)
-			if e1 == nil && e2 == nil && e3 == nil {
-				return (fr + in) * ps
-			}
+	// FreeBSD
+	if out, err := exec.Command("sysctl", "-n", "hw.pagesize", "vm.stats.vm.v_free_count",
+		"vm.stats.vm.v_inactive_count", "vm.swap_total").Output(); err == nil {
+		if v := uints(string(out)); len(v) == 4 {
+			return freeBSDAvail(v[0], v[1], v[2], v[3])
+		}
+	}
+	// macOS
+	if out, err := exec.Command("vm_stat").Output(); err == nil {
+		if n := vmStatAvail(string(out)); n > 0 {
+			return n
 		}
 	}
 	// last resort: half of physical RAM
@@ -1338,13 +1418,33 @@ func availableRAM() uint64 {
 	return 1 << 30 // conservative 1 GiB assumption
 }
 
+// searchThreads is the number of search workers: all CPUs, or CHESS_THREADS.
+func searchThreads() int {
+	n := runtime.NumCPU()
+	if v, err := strconv.Atoi(os.Getenv("CHESS_THREADS")); err == nil && v >= 1 && v <= n {
+		n = v
+	}
+	return n
+}
+
+// hashBytes is the memory to give the hash table: 80% of the available RAM
+// (floor 64 MB, cap 64 GB) and, with a time limit per move, no more than
+// the search can fill within it: about 48 MB per thread and second.
+func hashBytes(avail uint64, limit time.Duration, threads int) uint64 {
+	budget := avail * 4 / 5
+	if fill := limit.Seconds() * float64(threads) * (48 << 20); limit > 0 && fill < float64(budget) {
+		budget = uint64(fill)
+	}
+	return min(max(budget, 64<<20), 64<<30)
+}
+
 // initTT sizes the hash table from the RAM the machine can actually spare
-// (~80% of available, floor 64 MB, cap 64 GB, CHESS_HASH_MB env overrides)
-// and sets a Go runtime memory limit (table + GC headroom) so the process
-// can never OOM in any mode: all other engine data is fixed-size, so total
-// memory stays flat at this ceiling no matter how long it thinks. In
-// RAM-limited (0) mode this table is also the search budget itself.
-func initTT() {
+// (hashBytes, CHESS_HASH_MB env overrides) and sets a Go runtime memory
+// limit (table + GC headroom) so the process can never OOM in any mode: all
+// other engine data is fixed-size, so total memory stays flat at this
+// ceiling no matter how long it thinks. In RAM-limited (0) mode this table
+// is also the search budget itself.
+func initTT(limit time.Duration) {
 	var budget uint64
 	if s := os.Getenv("CHESS_HASH_MB"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v > 0 {
@@ -1352,13 +1452,7 @@ func initTT() {
 		}
 	}
 	if budget == 0 {
-		budget = availableRAM() * 4 / 5
-		if max := uint64(64) << 30; budget > max {
-			budget = max
-		}
-		if min := uint64(64) << 20; budget < min {
-			budget = min
-		}
+		budget = hashBytes(availableRAM(), limit, searchThreads())
 	}
 	entries := uint64(1)
 	for entries*2*ttEntryBytes <= budget {
@@ -1373,17 +1467,13 @@ func initTT() {
 	debug.SetMemoryLimit(int64(ttSize*ttEntryBytes + head))
 	if os.Getenv("CHESS_VERBOSE") == "1" || verbose {
 		fmt.Fprintf(os.Stderr, "hash: %d MB | memory limit: %d MB | threads: %d\n",
-			ttSize*ttEntryBytes>>20, (ttSize*ttEntryBytes+head)>>20, runtime.NumCPU())
+			ttSize*ttEntryBytes>>20, (ttSize*ttEntryBytes+head)>>20, searchThreads())
 	}
 }
 
-func encMove(m Move) uint64 {
-	return uint64(m.From) | uint64(m.To)<<6 | uint64(m.Promo)<<12 | uint64(m.Flags)<<16
-}
+func encMove(m Move) uint64 { return uint64(m) }
 
-func decMove(v uint64) Move {
-	return Move{From: int(v & 63), To: int(v >> 6 & 63), Promo: int(v >> 12 & 15), Flags: int(v >> 16 & 15)}
-}
+func decMove(v uint64) Move { return Move(v & 0xFFFFF) }
 
 // ttProbe returns (move, score, depth, flag, staticEval, hit). staticEval
 // is evalNone when the entry carries none.
@@ -1403,7 +1493,17 @@ func ttProbe(hash uint64) (Move, int, int, int, int, bool) {
 
 var ttStores atomic.Uint64 // stores since the current 0-mode search began
 
-func ttStore(hash uint64, m Move, score, depth, flag, ply, se int) {
+// ttStore counts its stores in the engine: a counter shared by all threads
+// would be written from every core on every node.
+func (e *Engine) ttStore(hash uint64, m Move, score, depth, flag, ply, se int) {
+	if ttStore(hash, m, score, depth, flag, ply, se) {
+		e.stores++
+	}
+}
+
+// ttStore reports whether it wrote an entry (false: it only refreshed the
+// age of a deeper one).
+func ttStore(hash uint64, m Move, score, depth, flag, ply, se int) bool {
 	if score > MateScore-2000 {
 		score += ply
 	} else if score < -(MateScore - 2000) {
@@ -1428,7 +1528,7 @@ func ttStore(hash uint64, m Move, score, depth, flag, ply, se int) {
 				nd := ed&^(uint64(63)<<20) | gen<<20 // refresh age only
 				atomic.StoreUint64(&e.data, nd)
 				atomic.StoreUint64(&e.xkey, hash^nd^ex)
-				return
+				return false
 			}
 			tgt = idx ^ s
 			break
@@ -1443,7 +1543,7 @@ func ttStore(hash uint64, m Move, score, depth, flag, ply, se int) {
 	atomic.StoreUint64(&e.xkey, hash^d^x)
 	atomic.StoreUint64(&e.data, d)
 	atomic.StoreUint64(&e.extra, x)
-	ttStores.Add(1)
+	return true
 }
 
 // ---------- verbose / debug instrumentation (VERBOSE=1) ----------
@@ -1606,11 +1706,11 @@ func pvString(root *Pos, first Move, maxLen int) string {
 type searchCtl struct {
 	stop        atomic.Bool
 	hasDeadline bool
-	deadline    time.Time     // hard stop, enforced inside the search
-	soft        time.Time     // don't start another iteration after this
-	memLimited  bool          // 0-mode: stop when the hash capacity is used up
-	nodes       atomic.Uint64 // ~nodes this move (flushed every 1024/worker)
-	nextMark    atomic.Uint64 // verbose: next 0-mode progress checkpoint
+	deadline    time.Time                  // hard stop, enforced inside the search
+	memLimited  bool                       // 0-mode: stop when the hash capacity is used up
+	nodes       atomic.Uint64              // ~nodes this move (flushed every 1024/worker)
+	nextMark    atomic.Uint64              // verbose: next 0-mode progress checkpoint
+	atDepth     [MaxDepth + 1]atomic.Int32 // workers searching each depth
 }
 
 // search-shape tuning constants (bisect: pass1 regression)
@@ -1634,7 +1734,8 @@ type Engine struct {
 	ctl       *searchCtl
 	stop      bool
 	nodes     uint64
-	seldepth  int // deepest ply touched (incl. quiescence)
+	stores    uint64 // hash stores not yet added to ttStores
+	seldepth  int    // deepest ply touched (incl. quiescence)
 	killers   [MaxPly][2]Move
 	excluded  [MaxPly]Move
 	corrHist  [2][16384]int32
@@ -1642,9 +1743,12 @@ type Engine struct {
 	counter   [2][64][64]Move  // countermove heuristic, indexed by prev move
 	capHist   [12][64][7]int32 // capture history: [attacker][to][victimType]
 	contHist  [2][768][768]int16
-	moveStack [MaxPly]Move // move that led to each ply (for countermoves)
-	evalStack [MaxPly]int  // static eval per ply (evalNone in check)
-	pcStack   [MaxPly]int  // pieceIdx*64+to of the move at each ply, -1 none
+	moveStack [MaxPly]Move      // move that led to each ply (for countermoves)
+	evalStack [MaxPly]int       // static eval per ply (evalNone in check)
+	pcStack   [MaxPly]int       // pieceIdx*64+to of the move at each ply, -1 none
+	mbuf      [MaxPly][256]Move // move list of each ply
+	sbuf      [256]int          // move ordering scores
+	qbuf      [256]Move         // move ordering scratch
 }
 
 func b2i(b bool) int {
@@ -1672,8 +1776,8 @@ func victimType(pc int) int {
 
 // quietHist is the combined quiet-move history used for ordering and LMR.
 func (e *Engine) quietHist(side int, m Move, ply int) int {
-	pc := pieceIdx(e.p.b[m.From])*64 + m.To
-	h := int(e.history[side][m.From][m.To])
+	pc := pieceIdx(e.p.b[m.From()])*64 + m.To()
+	h := int(e.history[side][m.From()][m.To()])
 	if ply >= 1 && e.pcStack[ply-1] >= 0 {
 		h += int(e.contHist[0][e.pcStack[ply-1]][pc])
 	}
@@ -1704,8 +1808,8 @@ func histUp16(h *int16, bonus int) {
 func (e *Engine) updateQuiets(cut Move, tried []Move, side, depth, ply int) {
 	bonus := imin(32*depth*depth+64*depth, 1280)
 	apply := func(m Move, b int) {
-		histUp32(&e.history[side][m.From][m.To], b)
-		pc := pieceIdx(e.p.b[m.From])*64 + m.To
+		histUp32(&e.history[side][m.From()][m.To()], b)
+		pc := pieceIdx(e.p.b[m.From()])*64 + m.To()
 		if ply >= 1 && e.pcStack[ply-1] >= 0 {
 			histUp16(&e.contHist[0][e.pcStack[ply-1]][pc], b)
 		}
@@ -1724,10 +1828,10 @@ func (e *Engine) updateQuiets(cut Move, tried []Move, side, depth, ply int) {
 func (e *Engine) capHistOf(m Move) *int32 {
 	p := e.p
 	v := WP
-	if m.Flags&fEP == 0 {
-		v = victimType(p.b[m.To])
+	if m.Flags()&fEP == 0 {
+		v = victimType(p.b[m.To()])
 	}
-	return &e.capHist[pieceIdx(p.b[m.From])][m.To][v]
+	return &e.capHist[pieceIdx(p.b[m.From()])][m.To()][v]
 }
 
 func (e *Engine) checkTime() {
@@ -1748,7 +1852,8 @@ func (e *Engine) checkTime() {
 	// RAM-limited (0) mode: the move's budget is one full hash table's worth
 	// of stored positions - the only limit in this mode is memory capacity.
 	if e.ctl.memLimited {
-		st := ttStores.Load()
+		st := ttStores.Add(e.stores)
+		e.stores = 0
 		if verbose {
 			if mark := e.ctl.nextMark.Load(); mark != 0 && st >= mark &&
 				e.ctl.nextMark.CompareAndSwap(mark, mark+(ttSize+9)/10) {
@@ -1768,118 +1873,130 @@ func (e *Engine) checkTime() {
 func (e *Engine) isRepetition() bool {
 	p := e.p
 	n := len(p.hist)
-	// walk back through positions with the same side to move; a match with any
-	// earlier hash is scored as a draw inside the search (2-fold).
-	for i := n - 3; i >= 0; i -= 2 {
+	// walk back through the positions with the same side to move since the
+	// last irreversible move; a match with an earlier hash is scored as a
+	// draw inside the search (2-fold).
+	for i, first := n-3, max(n-1-p.rev, 0); i >= first; i -= 2 {
 		if p.hist[i] == p.hash {
 			return true
 		}
-		// halfmove reset bounds how far repetitions can reach, but the clock is
-		// not tracked per hist entry; scanning all is correct, just a bit wider.
 	}
 	return false
 }
 
 func mvvLva(p *Pos, m Move) int {
-	victim := p.b[m.To]
-	if m.Flags&fEP != 0 {
+	victim := p.b[m.To()]
+	if m.Flags()&fEP != 0 {
 		victim = WP
 	}
 	if victim < 0 {
 		victim = -victim
 	}
-	attacker := p.b[m.From]
+	attacker := p.b[m.From()]
 	if attacker < 0 {
 		attacker = -attacker
 	}
 	s := pieceVal[victim]*16 - pieceVal[attacker]/16
-	if m.Promo != 0 {
-		s += pieceVal[m.Promo]
+	if m.Promo() != 0 {
+		s += pieceVal[m.Promo()]
 	}
 	return s
 }
 
-// sliderAttacker walks rays from (tx,ty) looking for `want`, treating
-// removed pieces as transparent (x-ray support for SEE).
-func (p *Pos) sliderAttacker(tx, ty int, dirs [][2]int, want int, removed *[64]bool) int {
-	for _, d := range dirs {
-		x, y := tx+d[0], ty+d[1]
-		for x >= 0 && x <= 7 && y >= 0 && y <= 7 {
-			sq := y*8 + x
-			if !removed[sq] && p.b[sq] != Empty {
-				if p.b[sq] == want {
-					return sq
-				}
-				break // blocked
+// The order in which SEE looks along the rays from the target for a bishop
+// or queen (NE, SE, NW, SW) and for a rook or queen (E, W, N, S).
+var seeDiag, seeLine = [4]int{4, 6, 5, 7}, [4]int{2, 3, 0, 1}
+
+// rayFirst returns the first square of occ in direction d from sq, or -1.
+func rayFirst(d, sq int, occ uint64) int {
+	b := rayBB[d][sq] & occ
+	if b == 0 {
+		return -1
+	}
+	if rayUp[d] {
+		return bits.TrailingZeros64(b)
+	}
+	return 63 - bits.LeadingZeros64(b)
+}
+
+// leastAttacker returns the square of the least valuable man of side that
+// attacks target with only the men of occ on the board; -1 if none. Among
+// equal attackers the choice is fixed: it decides which man behind them
+// joins the exchange next.
+func (p *Pos) leastAttacker(target, side int, occ uint64) int {
+	bb := &p.bb[side]
+	if b := pawnAttBB[side^1][target] & bb[WP] & occ; b != 0 {
+		return bits.TrailingZeros64(b)
+	}
+	if b := knightBB[target] & bb[WN] & occ; b != 0 {
+		return bits.TrailingZeros64(b)
+	}
+	if b := bb[WB] & occ; b&bishopMask[target] != 0 {
+		for _, d := range seeDiag {
+			if sq := rayFirst(d, target, occ); sq >= 0 && b>>uint(sq)&1 != 0 {
+				return sq
 			}
-			x += d[0]
-			y += d[1]
 		}
+	}
+	if b := bb[WR] & occ; b&rookMask[target] != 0 {
+		for _, d := range seeLine {
+			if sq := rayFirst(d, target, occ); sq >= 0 && b>>uint(sq)&1 != 0 {
+				return sq
+			}
+		}
+	}
+	if b := bb[WQ] & occ; b&(bishopMask[target]|rookMask[target]) != 0 {
+		for _, d := range seeDiag {
+			if sq := rayFirst(d, target, occ); sq >= 0 && b>>uint(sq)&1 != 0 {
+				return sq
+			}
+		}
+		for _, d := range seeLine {
+			if sq := rayFirst(d, target, occ); sq >= 0 && b>>uint(sq)&1 != 0 {
+				return sq
+			}
+		}
+	}
+	if b := kingBB[target] & bb[WK] & occ; b != 0 {
+		return bits.TrailingZeros64(b)
 	}
 	return -1
 }
 
-// leastAttacker returns the square of the least valuable piece of `side`
-// attacking target (removed pieces are transparent); -1 if none.
-func (p *Pos) leastAttacker(target, side int, removed *[64]bool) int {
-	tx, ty := target&7, target>>3
-	dir, pw, sign := 8, WP, 1
-	if side == Black {
-		dir, pw, sign = -8, BP, -1
-	}
-	if base := target - dir; base >= 1 && base <= 62 {
-		if x := base - 1; tx > 0 && !removed[x] && p.b[x] == pw {
-			return x
+// seeBelow reports whether see(m) < bound, for a bound <= 0. Capturing a
+// man worth at least the capturing one never loses material, so only the
+// other exchanges are played out.
+func (p *Pos) seeBelow(m Move, bound int) bool {
+	if m.Flags()&fCapture != 0 && m.Promo() == 0 {
+		victim, att := p.b[m.To()], p.b[m.From()]
+		if victim < 0 {
+			victim = -victim
 		}
-		if x := base + 1; tx < 7 && !removed[x] && p.b[x] == pw {
-			return x
+		if att < 0 {
+			att = -att
 		}
-	}
-	for _, d := range knightD {
-		x, y := tx+d[0], ty+d[1]
-		if x < 0 || x > 7 || y < 0 || y > 7 {
-			continue
+		if m.Flags()&fEP != 0 {
+			victim = WP
 		}
-		if sq := y*8 + x; !removed[sq] && p.b[sq] == sign*WN {
-			return sq
+		if seeVal[victim] >= seeVal[att] {
+			return false
 		}
 	}
-	if sq := p.sliderAttacker(tx, ty, bishD[:], sign*WB, removed); sq >= 0 {
-		return sq
-	}
-	if sq := p.sliderAttacker(tx, ty, rookD[:], sign*WR, removed); sq >= 0 {
-		return sq
-	}
-	if sq := p.sliderAttacker(tx, ty, bishD[:], sign*WQ, removed); sq >= 0 {
-		return sq
-	}
-	if sq := p.sliderAttacker(tx, ty, rookD[:], sign*WQ, removed); sq >= 0 {
-		return sq
-	}
-	for _, d := range kingD {
-		x, y := tx+d[0], ty+d[1]
-		if x < 0 || x > 7 || y < 0 || y > 7 {
-			continue
-		}
-		if sq := y*8 + x; !removed[sq] && p.b[sq] == sign*WK {
-			return sq
-		}
-	}
-	return -1
+	return p.see(m) < bound
 }
 
-// see estimates the material outcome of the capture sequence on m.To
+// see estimates the material outcome of the capture sequence on m.To()
 // (static exchange evaluation; pins are ignored - it's a pruning heuristic).
 func (p *Pos) see(m Move) int {
-	target := m.To
-	var removed [64]bool
+	target := m.To()
+	occ := p.occ[White] | p.occ[Black]
 	victim := p.b[target]
-	if m.Flags&fEP != 0 {
+	if m.Flags()&fEP != 0 {
 		victim = WP
 		if p.side == White {
-			removed[target-8] = true
+			occ &^= 1 << uint(target-8)
 		} else {
-			removed[target+8] = true
+			occ &^= 1 << uint(target+8)
 		}
 	}
 	if victim < 0 {
@@ -1888,18 +2005,18 @@ func (p *Pos) see(m Move) int {
 	var gain [40]int
 	d := 0
 	gain[0] = seeVal[victim]
-	att := p.b[m.From]
+	att := p.b[m.From()]
 	if att < 0 {
 		att = -att
 	}
-	if m.Promo != 0 {
-		gain[0] += seeVal[m.Promo] - seeVal[WP]
-		att = m.Promo
+	if m.Promo() != 0 {
+		gain[0] += seeVal[m.Promo()] - seeVal[WP]
+		att = m.Promo()
 	}
-	removed[m.From] = true
+	occ &^= 1 << uint(m.From())
 	side := p.side ^ 1
 	for d < 38 {
-		sq := p.leastAttacker(target, side, &removed)
+		sq := p.leastAttacker(target, side, occ)
 		if sq < 0 {
 			break
 		}
@@ -1912,7 +2029,7 @@ func (p *Pos) see(m Move) int {
 		if att < 0 {
 			att = -att
 		}
-		removed[sq] = true
+		occ &^= 1 << uint(sq)
 		side ^= 1
 	}
 	for ; d > 0; d-- {
@@ -1923,30 +2040,98 @@ func (p *Pos) see(m Move) int {
 	return gain[0]
 }
 
+// hashFirst moves the hash move to the front of moves, the others keeping
+// their order, and reports whether it is there. The search tries it before
+// the other moves are scored and sorted: it mostly cuts off.
+func hashFirst(moves []Move, ttMove Move) bool {
+	if ttMove != NoMove {
+		for i, m := range moves {
+			if m == ttMove {
+				copy(moves[1:i+1], moves[:i])
+				moves[0] = m
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// orderMoves sorts a whole move list: the hash move, the good captures and
+// promotions, the killers, the countermove, the other quiet moves by their
+// history and last the losing captures.
 func (e *Engine) orderMoves(moves []Move, ttMove Move, ply int) {
+	if hashFirst(moves, ttMove) {
+		moves = moves[1:]
+	}
+	qs, qe := e.orderCaptures(moves)
+	e.orderQuiets(moves[qs:qe], ply)
+}
+
+// sortMoves sorts moves by score, best first, equals keeping their order
+// (insertion sort: move lists are short).
+func sortMoves(moves []Move, scores []int) {
+	for i := 1; i < len(moves); i++ {
+		m, s := moves[i], scores[i]
+		j := i - 1
+		for j >= 0 && scores[j] < s {
+			moves[j+1], scores[j+1] = moves[j], scores[j]
+			j--
+		}
+		moves[j+1], scores[j+1] = m, s
+	}
+}
+
+func (e *Engine) scores(n int) []int {
+	if n > len(e.sbuf) {
+		return make([]int, n)
+	}
+	return e.sbuf[:n]
+}
+
+// orderCaptures rearranges moves into the good captures and promotions
+// (best first), the quiet moves (as generated) and the losing captures
+// (best first); the quiet moves are moves[qs:qe].
+func (e *Engine) orderCaptures(moves []Move) (qs, qe int) {
 	p := e.p
-	prev := NoMove
-	if ply >= 1 {
-		prev = e.moveStack[ply-1]
+	quiets, n := e.qbuf[:0], 0
+	for _, m := range moves {
+		if m.Flags()&fCapture != 0 || m.Promo() != 0 {
+			moves[n] = m
+			n++
+		} else {
+			quiets = append(quiets, m)
+		}
 	}
+	scores := e.scores(n)
+	for i, m := range moves[:n] {
+		if m.Flags()&fCapture == 0 {
+			scores[i] = (1 << 28) + pieceVal[m.Promo()]
+		} else if s := mvvLva(p, m) + int(*e.capHistOf(m))/16; m.Promo() != 0 || !p.seeBelow(m, 0) {
+			scores[i] = (1 << 28) + s
+		} else {
+			scores[i] = -(1 << 27) + s
+		}
+	}
+	sortMoves(moves[:n], scores)
+	for qs = n; qs > 0 && scores[qs-1] < 0; qs-- {
+	}
+	qe = qs + len(quiets)
+	copy(moves[qe:], moves[qs:n])
+	copy(moves[qs:], quiets)
+	return qs, qe
+}
+
+// orderQuiets sorts quiet moves: killers, the countermove, then by history.
+func (e *Engine) orderQuiets(moves []Move, ply int) {
+	p := e.p
 	counter := NoMove
-	if prev != NoMove {
-		counter = e.counter[p.side][prev.From][prev.To]
+	if ply >= 1 && e.moveStack[ply-1] != NoMove {
+		prev := e.moveStack[ply-1]
+		counter = e.counter[p.side][prev.From()][prev.To()]
 	}
-	scores := make([]int, len(moves))
+	scores := e.scores(len(moves))
 	for i, m := range moves {
 		switch {
-		case m == ttMove:
-			scores[i] = 1 << 30
-		case m.Flags&fCapture != 0:
-			s := mvvLva(p, m) + int(*e.capHistOf(m))/16
-			if m.Promo != 0 || p.see(m) >= 0 {
-				scores[i] = (1 << 28) + s // good captures right after TT move
-			} else {
-				scores[i] = -(1 << 27) + s // bad captures dead last
-			}
-		case m.Promo != 0:
-			scores[i] = (1 << 28) + pieceVal[m.Promo]
 		case m == e.killers[ply][0]:
 			scores[i] = 1 << 26
 		case m == e.killers[ply][1]:
@@ -1957,16 +2142,7 @@ func (e *Engine) orderMoves(moves []Move, ttMove Move, ply int) {
 			scores[i] = e.quietHist(p.side, m, ply)
 		}
 	}
-	// insertion sort by score desc (move lists are short)
-	for i := 1; i < len(moves); i++ {
-		m, s := moves[i], scores[i]
-		j := i - 1
-		for j >= 0 && scores[j] < s {
-			moves[j+1], scores[j+1] = moves[j], scores[j]
-			j--
-		}
-		moves[j+1], scores[j+1] = m, s
-	}
+	sortMoves(moves, scores)
 }
 
 func (e *Engine) quiesce(alpha, beta, ply int) int {
@@ -1979,6 +2155,9 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 		return 0
 	}
 	p := e.p
+	if insufficientMaterial(p) {
+		return 0
+	}
 	pvNode := beta-alpha > 1
 	ttMove, ttScore, _, ttFlag, ttEval, ttHit := ttProbe(p.hash)
 	if ttHit && !pvNode {
@@ -2011,7 +2190,7 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 		}
 		if stand >= beta {
 			if !ttHit {
-				ttStore(p.hash, NoMove, stand, 0, ttBeta, ply, stand)
+				e.ttStore(p.hash, NoMove, stand, 0, ttBeta, ply, stand)
 			}
 			return stand
 		}
@@ -2025,8 +2204,11 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 		}
 		return stand
 	}
-	moves := p.genPseudo(!inChk) // in check: all evasions; else captures/promos
-	e.orderMoves(moves, ttMove, ply)
+	moves := p.gen(e.mbuf[ply][:0], !inChk) // in check: all evasions; else captures/promos
+	lazy := hashFirst(moves, ttMove)
+	if !lazy {
+		e.orderMoves(moves, NoMove, ply)
+	}
 	origAlpha := alpha
 	best := stand
 	bestM := NoMove
@@ -2035,10 +2217,14 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 	if inChk {
 		se = evalNone
 	}
-	for _, m := range moves {
-		if !inChk && m.Promo == 0 {
-			victim := p.b[m.To]
-			if m.Flags&fEP != 0 {
+	for i := 0; i < len(moves); i++ {
+		if i == 1 && lazy {
+			e.orderMoves(moves[1:], NoMove, ply)
+		}
+		m := moves[i]
+		if !inChk && m.Promo() == 0 {
+			victim := p.b[m.To()]
+			if m.Flags()&fEP != 0 {
 				victim = WP
 			}
 			if victim < 0 {
@@ -2047,7 +2233,7 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 			if stand+pieceVal[victim]+200 <= alpha {
 				continue // delta pruning
 			}
-			if p.see(m) < 0 {
+			if p.seeBelow(m, 0) {
 				continue // losing capture
 			}
 		}
@@ -2058,7 +2244,7 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 		}
 		legal++
 		e.moveStack[ply] = m
-		e.pcStack[ply] = pieceIdx(p.b[m.To])*64 + m.To
+		e.pcStack[ply] = pieceIdx(p.b[m.To()])*64 + m.To()
 		score := -e.quiesce(-beta, -alpha, ply+1)
 		p.unmake(m, u)
 		if e.stop {
@@ -2069,7 +2255,7 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 			bestM = m
 		}
 		if score >= beta {
-			ttStore(p.hash, bestM, best, 0, ttBeta, ply, se)
+			e.ttStore(p.hash, bestM, best, 0, ttBeta, ply, se)
 			return score
 		}
 		if score > alpha {
@@ -2083,7 +2269,7 @@ func (e *Engine) quiesce(alpha, beta, ply int) int {
 	if best > origAlpha {
 		flag = ttExact
 	}
-	ttStore(p.hash, bestM, best, 0, flag, ply, se)
+	e.ttStore(p.hash, bestM, best, 0, flag, ply, se)
 	return best
 }
 
@@ -2113,7 +2299,7 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 	}
 	p := e.p
 	if ply > 0 {
-		if p.half >= 100 || e.isRepetition() {
+		if p.half >= 100 || e.isRepetition() || insufficientMaterial(p) {
 			return 0
 		}
 		// mate-distance pruning
@@ -2210,9 +2396,11 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 			p.side ^= 1
 			p.hash ^= zSide
 			p.hist = append(p.hist, p.hash)
+			p.rev++
 			e.moveStack[ply] = NoMove
 			e.pcStack[ply] = -1
 			score := -e.search(depth-1-R, ply+1, -beta, -beta+1, false)
+			p.rev--
 			p.hist = p.hist[:len(p.hist)-1]
 			p.side ^= 1
 			p.hash ^= zSide
@@ -2245,14 +2433,14 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 		// depth almost certainly beats beta at full depth
 		if depth >= 5 && beta < MateScore-2000 {
 			pcBeta := beta + 170
-			caps := p.genPseudo(true)
+			caps := p.gen(e.mbuf[ply][:0], true)
 			e.orderMoves(caps, NoMove, ply)
 			tried := 0
 			for _, m := range caps {
 				if tried >= 3 {
 					break
 				}
-				if m.Flags&fCapture != 0 && p.see(m) < 0 {
+				if m.Flags()&fCapture != 0 && p.seeBelow(m, 0) {
 					continue
 				}
 				u := p.make(m)
@@ -2262,7 +2450,7 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 				}
 				tried++
 				e.moveStack[ply] = m
-				e.pcStack[ply] = pieceIdx(p.b[m.To])*64 + m.To
+				e.pcStack[ply] = pieceIdx(p.b[m.To()])*64 + m.To()
 				v := -e.quiesce(-pcBeta, -pcBeta+1, ply+1)
 				if v >= pcBeta {
 					v = -e.search(depth-4, ply+1, -pcBeta, -pcBeta+1, true)
@@ -2272,7 +2460,7 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 					return 0
 				}
 				if v >= pcBeta {
-					ttStore(p.hash, m, v, depth-3, ttBeta, ply, rawEval)
+					e.ttStore(p.hash, m, v, depth-3, ttBeta, ply, rawEval)
 					return v
 				}
 			}
@@ -2296,8 +2484,12 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 			return sBeta // multicut: several moves already beat beta
 		}
 	}
-	moves := p.genPseudo(false)
-	e.orderMoves(moves, ttMove, ply)
+	// The moves are put in order as the search gets to them: the hash move
+	// first, then the captures and, only if some will be tried, the quiet
+	// moves moves[qs:qe]. Mostly an early move cuts the search off.
+	moves := p.gen(e.mbuf[ply][:0], false)
+	first := b2i(hashFirst(moves, ttMove))
+	qs, qe := len(moves), len(moves)
 	origAlpha := alpha
 	legal, quiets := 0, 0
 	bestScore := -Inf
@@ -2305,15 +2497,26 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 	var triedQuiets [32]Move
 	var triedCaps [32]Move
 	nTQ, nTC := 0, 0
-	for _, m := range moves {
+	for i := 0; i < len(moves); i++ {
+		if i == first {
+			qs, qe = e.orderCaptures(moves[first:])
+			qs, qe = qs+first, qe+first
+		}
+		if i == qs && qs < qe {
+			if !pvNode && !inChk && legal > 0 && bestScore > -(MateScore-2000) && depth <= 8 &&
+				staticEval+90+100*depth+futImp*b2i(improving) <= alpha {
+				if i = qe; i == len(moves) { // futility prunes every quiet move
+					break
+				}
+			} else {
+				e.orderQuiets(moves[qs:qe], ply)
+			}
+		}
+		m := moves[i]
 		if m == excl {
 			continue
 		}
-		isQuiet := m.Flags&fCapture == 0 && m.Promo == 0
-		mHist := 0
-		if isQuiet {
-			mHist = e.quietHist(p.side, m, ply) // must read before make()
-		}
+		isQuiet := m.Flags()&fCapture == 0 && m.Promo() == 0
 		// prune late/hopeless moves (only after one legal move is confirmed)
 		if !pvNode && !inChk && legal > 0 && bestScore > -(MateScore-2000) {
 			if isQuiet {
@@ -2322,17 +2525,23 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 					lmpLimit /= 2
 				}
 				if depth <= lmpDepth && quiets > lmpLimit {
-					continue // late move pruning
+					i = qe - 1 // late move pruning, of all the quiet moves left
+					continue
 				}
 				if depth <= 8 && staticEval+90+100*depth+futImp*b2i(improving) <= alpha {
-					continue // futility pruning
+					i = qe - 1 // futility pruning, of all the quiet moves left
+					continue
 				}
 				if depth <= 8 && p.see(m) < -25*depth*depth {
 					continue // SEE pruning: quiet loses material badly
 				}
-			} else if depth <= 6 && m.Promo == 0 && p.see(m) < -100*depth {
+			} else if depth <= 6 && m.Promo() == 0 && p.seeBelow(m, -100*depth) {
 				continue // SEE pruning: clearly losing capture
 			}
+		}
+		mHist := 0
+		if isQuiet && depth >= 3 && !inChk {
+			mHist = e.quietHist(p.side, m, ply) // for the reduction; must read before make()
 		}
 		u := p.make(m)
 		if p.attacked(p.kingSq[p.side^1], p.side) {
@@ -2346,13 +2555,13 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 				triedQuiets[nTQ] = m
 				nTQ++
 			}
-		} else if m.Flags&fCapture != 0 && nTC < 32 {
+		} else if m.Flags()&fCapture != 0 && nTC < 32 {
 			triedCaps[nTC] = m
 			nTC++
 		}
 		givesCheck := p.inCheck(p.side)
 		e.moveStack[ply] = m
-		e.pcStack[ply] = pieceIdx(p.b[m.To])*64 + m.To
+		e.pcStack[ply] = pieceIdx(p.b[m.To()])*64 + m.To()
 		nd := depth - 1
 		if m == ttMove {
 			nd += ext
@@ -2405,9 +2614,9 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 				e.updateQuiets(m, triedQuiets[:nTQ], p.side, depth, ply)
 				if ply >= 1 && e.moveStack[ply-1] != NoMove {
 					prev := e.moveStack[ply-1]
-					e.counter[p.side][prev.From][prev.To] = m
+					e.counter[p.side][prev.From()][prev.To()] = m
 				}
-			} else if m.Flags&fCapture != 0 {
+			} else if m.Flags()&fCapture != 0 {
 				bonus := imin(32*depth*depth+64*depth, 1280)
 				histUp32(e.capHistOf(m), bonus)
 				for i := 0; i < nTC; i++ {
@@ -2447,7 +2656,7 @@ func (e *Engine) search(depth, ply, alpha, beta int, nullOK bool) int {
 		*c = nv
 	}
 	if excl == NoMove {
-		ttStore(p.hash, bestM, bestScore, depth, flag, ply, rawEval)
+		e.ttStore(p.hash, bestM, bestScore, depth, flag, ply, rawEval)
 	}
 	return bestScore
 }
@@ -2466,7 +2675,7 @@ func (e *Engine) rootSearch(moves []Move, depth, alpha, beta int) (int, Move) {
 	for i, m := range moves {
 		u := e.p.make(m)
 		e.moveStack[0] = m
-		e.pcStack[0] = pieceIdx(e.p.b[m.To])*64 + m.To
+		e.pcStack[0] = pieceIdx(e.p.b[m.To()])*64 + m.To()
 		var score int
 		if i == 0 {
 			score = -e.search(depth-1, 1, -beta, -alpha, true)
@@ -2501,18 +2710,13 @@ func (e *Engine) rootSearch(moves []Move, depth, alpha, beta int) (int, Move) {
 // been stored, then plays). Workers share the XOR-validated lock-free TT;
 // played moves always come from the legal list, so races can never yield an
 // illegal move.
-func bestMove(p *Pos, budget, depthCap int) Move {
+func bestMove(p *Pos, budget time.Duration, depthCap int) Move {
 	searchStart := time.Now()
 	legal := p.genLegal()
 	if len(legal) == 0 {
 		return NoMove
 	}
-	workers := runtime.NumCPU()
-	if v := os.Getenv("CHESS_THREADS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= workers {
-			workers = n
-		}
-	}
+	workers := searchThreads()
 	if len(legal) == 1 {
 		if verbose {
 			vlog("forced: only one legal move -> %s", moveStr(legal[0]))
@@ -2526,8 +2730,7 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 	c := &searchCtl{}
 	if budget > 0 {
 		c.hasDeadline = true
-		c.deadline = searchStart.Add(time.Duration(budget) * time.Second)
-		c.soft = searchStart.Add(time.Duration(budget) * time.Second * 55 / 100)
+		c.deadline = searchStart.Add(budget)
 	} else if depthCap == 0 {
 		// 0 = RAM-limited: no clock, no depth cap; think until this move has
 		// stored one full hash table's worth of positions, then play.
@@ -2541,7 +2744,7 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 		var mode string
 		switch {
 		case budget > 0:
-			mode = fmt.Sprintf("TIME %d s (soft-stop %.1f s)", budget, float64(budget)*0.55)
+			mode = fmt.Sprintf("TIME %g s", budget.Seconds())
 		case depthCap > 0:
 			mode = fmt.Sprintf("DEPTH %d", depthCap)
 		default:
@@ -2575,6 +2778,7 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 			e.ctl = c
 			e.stop = false
 			e.nodes = 0
+			e.stores = 0
 			e.seldepth = 0
 			e.killers = [MaxPly][2]Move{}
 			e.moveStack = [MaxPly]Move{}
@@ -2593,10 +2797,14 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 				startD = maxD
 			}
 			for depth := startD; depth <= maxD; depth++ {
-				if c.hasDeadline && depth > startD && time.Now().After(c.soft) {
-					break // a new iteration would very likely not finish
+				// helpers spread out: with half of the workers on a depth
+				// already, a helper goes on to the next one
+				for w > 0 && depth < maxD && int(c.atDepth[depth].Load()) >= (workers+1)/2 {
+					depth++
 				}
-				e.orderMoves(moves, myBest, 0)
+				c.atDepth[depth].Add(1)
+				first := myBest
+				e.orderMoves(moves, first, 0)
 				window := 30
 				alpha, beta := -Inf, Inf
 				if depth >= 5 {
@@ -2631,15 +2839,22 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 						beta = Inf
 					}
 				}
-				if e.stop {
-					break // discard partial iteration
+				// an interrupted iteration still counts when it searched a move to
+				// the end and that move beats the lower bound of the window
+				partial := e.stop
+				if partial && (iterBest == NoMove || iterScore <= alpha) {
+					break
 				}
 				if iterBest != NoMove {
 					myBest = iterBest
 					prevScore = iterScore
-					ttStore(e.p.hash, myBest, iterScore, depth, ttExact, 0, e.evalStack[0])
+					if !partial {
+						e.ttStore(e.p.hash, myBest, iterScore, depth, ttExact, 0, e.evalStack[0])
+					}
 					mu.Lock()
-					if depth > bestDepth {
+					// (an interrupted search has only compared its moves with
+					// the one it tried first)
+					if depth > bestDepth && (!partial || first == best) {
 						bestDepth = depth
 						best = myBest
 						bestScore = iterScore
@@ -2650,16 +2865,21 @@ func bestMove(p *Pos, budget, depthCap int) Move {
 							if el > 0 {
 								nps = uint64(float64(nodes) / el)
 							}
-							vlog("depth %2d sel %2d | %s | best %s | nodes %s | nps %s | tt %.1f%% | pv %s",
+							done := ""
+							if partial {
+								done = " (interrupted)"
+							}
+							vlog("depth %2d sel %2d | %s | best %s | nodes %s | nps %s | tt %.1f%% | pv %s%s",
 								depth, e.seldepth, scoreStr(iterScore), moveStr(myBest),
 								fmtN(nodes), fmtN(nps), ttFullPct(),
-								pvString(p, myBest, imin(depth, 12)))
+								pvString(p, myBest, imin(depth, 12)), done)
 						}
 					}
 					mu.Unlock()
 				}
-				if iterScore > MateScore-2000 || iterScore < -(MateScore-2000) {
-					break // proven mate either way; deeper search can't change it
+				c.atDepth[depth].Add(-1)
+				if partial || iterScore > MateScore-2000 || iterScore < -(MateScore-2000) {
+					break // stopped, or proven mate either way: deeper search can't change it
 				}
 			}
 			// first worker to finish (mate, depth cap or deadline) stops the rest
@@ -2699,9 +2919,9 @@ func sqName(sq int) string {
 }
 
 func moveStr(m Move) string {
-	s := sqName(m.From) + sqName(m.To)
-	if m.Promo != 0 {
-		s += string("  nbrq"[m.Promo])
+	s := sqName(m.From()) + sqName(m.To())
+	if m.Promo() != 0 {
+		s += string("  nbrq"[m.Promo()])
 	}
 	return s
 }
@@ -2734,11 +2954,11 @@ func parseMove(p *Pos, in string, legal []Move) (Move, string) {
 	}
 	needPromo := false
 	for _, m := range legal {
-		if m.From == from && m.To == to {
-			if m.Promo == promo {
+		if m.From() == from && m.To() == to {
+			if m.Promo() == promo {
 				return m, ""
 			}
-			if m.Promo != 0 && promo == 0 {
+			if m.Promo() != 0 && promo == 0 {
 				needPromo = true
 			}
 		}
@@ -2774,34 +2994,16 @@ func drawBoard(p *Pos, w *bufio.Writer) {
 // ---------- game state ----------
 
 func insufficientMaterial(p *Pos) bool {
-	var bishops []int
-	knights := 0
-	for sq := 0; sq < 64; sq++ {
-		switch p.b[sq] {
-		case Empty, WK, BK:
-		case WB, BB:
-			bishops = append(bishops, sq)
-		case WN, BN:
-			knights++
-		default:
-			return false // pawn, rook or queen on the board
-		}
+	w, b := &p.bb[White], &p.bb[Black]
+	if w[WP]|b[WP]|w[WR]|b[WR]|w[WQ]|b[WQ] != 0 {
+		return false
 	}
-	pieces := len(bishops) + knights
-	if pieces == 0 || pieces == 1 {
-		return true // K vs K, K+minor vs K
-	}
+	bishops, knights := w[WB]|b[WB], w[WN]|b[WN]
 	if knights == 0 {
-		// only bishops: draw if all are on the same square color
-		color := (bishops[0]>>3 + bishops[0]&7) & 1
-		for _, sq := range bishops[1:] {
-			if (sq>>3+sq&7)&1 != color {
-				return false
-			}
-		}
-		return true
+		// K vs K, or nothing but bishops on squares of one color
+		return bishops&lightSquares == 0 || bishops&^lightSquares == 0
 	}
-	return false
+	return bishops == 0 && knights&(knights-1) == 0 // K+N vs K
 }
 
 func repetitionCount(p *Pos) int {
@@ -2839,8 +3041,112 @@ func gameResult(p *Pos) (string, string) {
 
 // ---------- main game loop ----------
 
+const usageText = `usage: chess [gui] [demo|silentdemo] [options] [limit]  (exactly one limit per mode)
+  limit > 0: TIME-limited - max seconds per move (default 600, fractions allowed)
+  limit < 0: DEPTH-limited - fixed search depth (-10 = depth 10)
+  limit = 0: RAM-limited - hash auto-sized from available RAM
+             (CHESS_HASH_MB overrides); moves when it's used up
+  demo: computer plays both sides, board redrawn after every move
+  silentdemo: same but without the boards (moves + result only)
+  gui: X11 board window where you play White (same limits)
+  gui demo: X11 window where the engine plays both sides
+  gui options (each one is also an environment variable):
+    --icons    CHESS_ICONS=1    piece icons instead of single letters
+    --no-cpu   CHESS_NO_CPU=1   hide the CPU MOVE button (no engine help)
+    --input=M  CHESS_INPUT=M    how to move: both (default), click or drag
+  gui moves: drag a piece and drop it on its target square, or click the
+    piece and then the target. Clicking the selected piece again, dropping
+    it back where it was or a right click cancels, so another can be picked.
+  -h, --help: this text
+  env: VERBOSE=1 full search/debug trace on stderr
+       CHESS_HASH_MB=<mb> hash size | CHESS_FEN=<fen> start position
+examples:
+  chess 5                       text mode, 5 seconds per computer move
+  chess gui 5                   board window: letters and the CPU MOVE button
+  chess gui --icons 5           icons instead of single letters
+  chess gui --no-cpu 5          hidden CPU MOVE button
+  chess gui --icons --no-cpu 5  icons and no CPU MOVE button
+  CHESS_ICONS=1 CHESS_NO_CPU=1 chess gui 5   the same with the environment
+`
+
+// config is what the command line and the environment ask for.
+type config struct {
+	budget                  time.Duration // > 0: time limit per move
+	depthCap                int           // > 0: fixed search depth
+	demo, silent, gui, help bool
+	opt                     guiOpts
+}
+
+// parseArgs reads the mode keywords, options and the limit, in any order.
+func parseArgs(args []string, env func(string) string) (c config, err error) {
+	c.budget = 600 * time.Second
+	on := func(k string) bool { return env(k) != "" && env(k) != "0" }
+	c.opt.icons, c.opt.noCPU = on("CHESS_ICONS"), on("CHESS_NO_CPU")
+	input, limits := env("CHESS_INPUT"), 0
+	bad := func(format string, a ...any) {
+		if err == nil {
+			err = fmt.Errorf(format, a...)
+		}
+	}
+	for _, a := range args {
+		switch la := strings.ToLower(a); {
+		case la == "demo":
+			c.demo = true
+		case la == "silentdemo" || la == "sdemo":
+			c.demo, c.silent = true, true
+		case la == "gui":
+			c.gui = true
+		case la == "-h" || la == "--help":
+			c.help = true
+		case la == "--icons":
+			c.opt.icons = true
+		case la == "--no-cpu":
+			c.opt.noCPU = true
+		case strings.HasPrefix(la, "--input="):
+			input = la[len("--input="):]
+		default:
+			v, e := strconv.ParseFloat(a, 64)
+			limits++
+			switch {
+			case e != nil || math.IsNaN(v) || math.Abs(v) > 1e9:
+				bad("bad argument %q", a)
+			case limits > 1:
+				bad("more than one limit: %q", a)
+			case v >= 0.001:
+				c.budget, c.depthCap = time.Duration(v*float64(time.Second)), 0
+			case v == 0:
+				c.budget, c.depthCap = 0, 0 // truly unlimited
+			case v <= -1 && v == math.Trunc(v):
+				c.budget, c.depthCap = 0, int(-v)
+			default:
+				bad("bad limit %q", a)
+			}
+		}
+	}
+	switch strings.ToLower(input) {
+	case "", "both":
+		c.opt.input = inputBoth
+	case "click":
+		c.opt.input = inputClick
+	case "drag":
+		c.opt.input = inputDrag
+	default:
+		bad("bad input mode %q (use both, click or drag)", input)
+	}
+	return
+}
+
 func main() {
-	initTT()
+	cfg, err := parseArgs(os.Args[1:], os.Getenv)
+	if cfg.help {
+		fmt.Print(usageText)
+		return
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "chess: %v\n%s", err, usageText)
+		os.Exit(1)
+	}
+	initTT(cfg.budget)
 	initZobrist()
 	initMasks()
 	initLMR()
@@ -2848,58 +3154,14 @@ func main() {
 		selfTest()
 		return
 	}
-	budget, depthCap := 600, 0
-	demo, silent, gui := false, false, false
-	args := os.Args[1:]
-	for len(args) > 0 { // leading mode keywords combine: e.g. "gui demo"
-		if strings.EqualFold(args[0], "demo") {
-			demo = true
-		} else if strings.EqualFold(args[0], "silentdemo") || strings.EqualFold(args[0], "sdemo") {
-			demo, silent = true, true
-		} else if strings.EqualFold(args[0], "gui") {
-			gui = true
-		} else {
-			break
-		}
-		args = args[1:]
-	}
-	usage := func() {
-		fmt.Fprintln(os.Stderr, "usage: chess [demo|silentdemo] [limit]  (exactly one limit per mode)")
-		fmt.Fprintln(os.Stderr, "  limit > 0: TIME-limited - max seconds per move (default 600)")
-		fmt.Fprintln(os.Stderr, "  limit < 0: DEPTH-limited - fixed search depth (-10 = depth 10)")
-		fmt.Fprintln(os.Stderr, "  limit = 0: RAM-limited - hash auto-sized from available RAM")
-		fmt.Fprintln(os.Stderr, "             (CHESS_HASH_MB overrides); moves when it's used up")
-		fmt.Fprintln(os.Stderr, "  demo: computer plays both sides, board redrawn after every move")
-		fmt.Fprintln(os.Stderr, "  silentdemo: same but without the boards (moves + result only)")
-		fmt.Fprintln(os.Stderr, "  gui: X11 board window - drag & drop your moves (same limits)")
-		fmt.Fprintln(os.Stderr, "  gui demo: X11 window where the engine plays both sides")
-		fmt.Fprintln(os.Stderr, "  env: VERBOSE=1 full search/debug trace on stderr")
-		fmt.Fprintln(os.Stderr, "       CHESS_HASH_MB=<mb> hash size | CHESS_FEN=<fen> start position")
-		os.Exit(1)
-	}
-	if len(args) > 1 {
-		usage()
-	}
-	if len(args) == 1 {
-		v, err := strconv.Atoi(args[0])
-		if err != nil {
-			usage()
-		}
-		switch {
-		case v > 0:
-			budget = v
-		case v < 0:
-			budget, depthCap = 0, -v
-		default:
-			budget = 0 // truly unlimited
-		}
-	}
+	budget, depthCap := cfg.budget, cfg.depthCap
+	demo, silent := cfg.demo, cfg.silent
 	p := startPos()
 	if fen := os.Getenv("CHESS_FEN"); fen != "" {
 		p = fromFEN(fen) // testing aid: start from an arbitrary position
 	}
-	if gui {
-		guiLoop(p, budget, depthCap, demo)
+	if cfg.gui {
+		guiLoop(p, budget, depthCap, demo, cfg.opt)
 		return
 	}
 	out := bufio.NewWriter(os.Stdout)
@@ -3045,7 +3307,9 @@ func fromFEN(fen string) *Pos {
 			case 'k':
 				pc = BK
 			}
-			p.b[sq] = pc
+			if pc != Empty {
+				p.set(pc, sq)
+			}
 			if pc == WK {
 				p.kingSq[White] = sq
 			}
@@ -3072,8 +3336,22 @@ func fromFEN(fen string) *Pos {
 			}
 		}
 	}
-	if len(parts) > 3 && parts[3] != "-" {
-		p.ep = int(parts[3][1]-'1')*8 + int(parts[3][0]-'a')
+	if len(parts) > 3 && len(parts[3]) == 2 {
+		// kept only when it is a real en passant chance, as make() does
+		pawn, rank, to := WP, 2, 8
+		if p.side == White {
+			pawn, rank, to = BP, 5, -8
+		}
+		ep := int(parts[3][1]-'1')*8 + int(parts[3][0]-'a')
+		if ep>>3 == rank && parts[3][0] >= 'a' && parts[3][0] <= 'h' && p.b[ep] == Empty &&
+			p.b[ep+to] == pawn && p.epLegal(ep, p.side) {
+			p.ep = ep
+		}
+	}
+	if len(parts) > 4 {
+		if v, err := strconv.Atoi(parts[4]); err == nil && v > 0 {
+			p.half = v
+		}
 	}
 	p.hash = p.computeHash()
 	p.pawnKey = p.computePawnKey()
@@ -3091,6 +3369,9 @@ func perft(p *Pos, d int) uint64 {
 		if !p.attacked(p.kingSq[p.side^1], p.side) {
 			if p.pawnKey != p.computePawnKey() {
 				panic("pawnKey mismatch")
+			}
+			if !p.consistent() {
+				panic("piece sets or scores do not match the board")
 			}
 			if p.hash != p.computeHash() {
 				fmt.Println("ZOBRIST MISMATCH after", moveStr(m))
@@ -3147,13 +3428,16 @@ func selfTest() {
 }
 
 // ---------- optional GUI mode: a raw-X11 (wire protocol) chessboard ----------
-// Zero dependencies kept: this speaks the core X11 protocol directly over the
-// unix socket (works with any X server: real, XWayland, Xvfb, ...).
+// Zero dependencies kept: this speaks the core X11 protocol directly and
+// paints the whole window itself (board, pieces, text) into a grayscale
+// frame sent with PutImage, so it needs no server fonts, images or files
+// (works with any X server: real, XQuartz, XWayland, Xvfb, ...).
 
 type x11Conn struct {
 	c         net.Conn
 	buf       *bufio.Writer
 	seq       uint16
+	waitSeq   atomic.Uint32 // sequence number of the request awaiting its reply
 	ridBase   uint32
 	ridNext   uint32
 	root      uint32
@@ -3162,6 +3446,11 @@ type x11Conn struct {
 	cmap      uint32
 	white     uint32
 	black     uint32
+	maxReq    int // largest request the server takes, in bytes
+	bpp, pad  int // bits per pixel and scanline pad of rootDepth images
+	msbFirst  bool
+	trueColor bool
+	rgbMask   [3]uint32
 	events    chan []byte
 	replies   chan []byte
 	readErr   error
@@ -3180,8 +3469,9 @@ func rd32(b []byte) uint32 {
 }
 func pad4(n int) int { return (4 - n&3) & 3 }
 
-// xAuthCookie finds an MIT-MAGIC-COOKIE-1 for this display in ~/.Xauthority.
-func xAuthCookie(disp string) (name string, data []byte) {
+// xAuthCookie finds an MIT-MAGIC-COOKIE-1 for this display number in
+// ~/.Xauthority.
+func xAuthCookie(dispNum string) (name string, data []byte) {
 	path := os.Getenv("XAUTHORITY")
 	if path == "" {
 		home, err := os.UserHomeDir()
@@ -3193,10 +3483,6 @@ func xAuthCookie(disp string) (name string, data []byte) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", nil
-	}
-	dispNum := strings.TrimPrefix(disp, ":")
-	if i := strings.IndexByte(dispNum, '.'); i >= 0 {
-		dispNum = dispNum[:i]
 	}
 	var fbName string
 	var fbData []byte
@@ -3243,34 +3529,62 @@ func xAuthCookie(disp string) (name string, data []byte) {
 	return fbName, fbData
 }
 
+// x11Dial opens $DISPLAY. A display can be reached in more than one way and
+// the first that answers is used: a socket path as XQuartz sets it
+// (/private/tmp/com.apple.launchd.X/org.xquartz:0), the unix socket of
+// display N, TCP port 6000+N.
 func x11Dial() (*x11Conn, error) {
 	disp := os.Getenv("DISPLAY")
 	if disp == "" {
 		disp = ":0"
 	}
-	num := disp
-	if i := strings.LastIndexByte(num, ':'); i >= 0 {
-		num = num[i+1:]
-	}
+	colon := strings.LastIndexByte(disp, ':')
+	num := disp[colon+1:]
 	if i := strings.IndexByte(num, '.'); i >= 0 {
 		num = num[:i]
 	}
-	var c net.Conn
-	var err error
-	if strings.HasPrefix(disp, ":") || strings.HasPrefix(disp, "unix:") {
-		c, err = net.Dial("unix", "/tmp/.X11-unix/X"+num)
-	} else { // host:N
-		host := disp[:strings.LastIndexByte(disp, ':')]
-		port := 6000
-		if v, e := strconv.Atoi(num); e == nil {
-			port += v
+	port := "6000"
+	if v, err := strconv.Atoi(num); err == nil {
+		port = strconv.Itoa(6000 + v)
+	}
+	local := [][2]string{{"unix", "/tmp/.X11-unix/X" + num}, {"tcp", "localhost:" + port}}
+	var ways [][2]string
+	switch {
+	case strings.HasPrefix(disp, "/"):
+		ways = [][2]string{{"unix", disp}}
+		if i := strings.LastIndexByte(disp, '.'); i > colon && colon >= 0 {
+			ways = append(ways, [2]string{"unix", disp[:i]}) // without the screen number
 		}
-		c, err = net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
+		if colon >= 0 {
+			ways = append(ways, local...)
+		}
+	case strings.HasPrefix(disp, ":"):
+		ways = local
+	case strings.HasPrefix(disp, "unix:"):
+		ways = local[:1]
+	default: // host:N
+		ways = [][2]string{{"tcp", net.JoinHostPort(strings.Trim(disp[:max(colon, 0)], "[]"), port)}}
 	}
-	if err != nil {
-		return nil, err
+	var first error
+	for _, w := range ways {
+		c, err := net.DialTimeout(w[0], w[1], 5*time.Second)
+		if err == nil {
+			var x *x11Conn
+			if x, err = x11Setup(c, num); err == nil {
+				return x, nil
+			}
+			c.Close()
+		}
+		if first == nil {
+			first = err
+		}
 	}
-	authName, authData := xAuthCookie(disp)
+	return nil, first
+}
+
+// x11Setup does the connection setup on c for display number num.
+func x11Setup(c net.Conn, num string) (*x11Conn, error) {
+	authName, authData := xAuthCookie(num)
 	req := make([]byte, 12+len(authName)+pad4(len(authName))+len(authData)+pad4(len(authData)))
 	req[0] = 'l'
 	le16(req[2:], 11)
@@ -3278,21 +3592,23 @@ func x11Dial() (*x11Conn, error) {
 	le16(req[8:], uint16(len(authData)))
 	copy(req[12:], authName)
 	copy(req[12+len(authName)+pad4(len(authName)):], authData)
-	if _, err = c.Write(req); err != nil {
+	c.SetDeadline(time.Now().Add(15 * time.Second)) // a server may accept and never answer
+	if _, err := c.Write(req); err != nil {
 		return nil, err
 	}
 	head := make([]byte, 8)
-	if _, err = io.ReadFull(c, head); err != nil {
+	if _, err := io.ReadFull(c, head); err != nil {
 		return nil, err
 	}
 	body := make([]byte, int(rd16(head[6:]))*4)
-	if _, err = io.ReadFull(c, body); err != nil {
+	if _, err := io.ReadFull(c, body); err != nil {
 		return nil, err
 	}
+	c.SetDeadline(time.Time{})
 	if head[0] != 1 {
 		n := int(head[1])
 		msg := ""
-		if 8+n <= len(body)+8 && n <= len(body) {
+		if n <= len(body) {
 			msg = string(body[:n])
 		}
 		return nil, fmt.Errorf("X11 connection refused: %s", msg)
@@ -3300,8 +3616,11 @@ func x11Dial() (*x11Conn, error) {
 	x := &x11Conn{c: c, buf: bufio.NewWriter(c)}
 	x.ridBase = rd32(body[4:])
 	vlen := int(rd16(body[16:]))
+	x.maxReq = int(rd16(body[18:])) * 4
 	nform := int(body[21])
-	off := 32 + vlen + pad4(vlen) + 8*nform
+	x.msbFirst = body[22] != 0
+	forms := 32 + vlen + pad4(vlen)
+	off := forms + 8*nform
 	// first screen
 	x.root = rd32(body[off:])
 	x.cmap = rd32(body[off+4:])
@@ -3309,6 +3628,25 @@ func x11Dial() (*x11Conn, error) {
 	x.black = rd32(body[off+12:])
 	x.visual = rd32(body[off+32:])
 	x.rootDepth = body[off+38]
+	for i := 0; i < nform; i++ {
+		if f := body[forms+8*i:]; f[0] == x.rootDepth {
+			x.bpp, x.pad = int(f[1]), int(f[2])
+		}
+	}
+	if x.bpp < 8 || x.bpp%8 != 0 || x.pad < 8 {
+		return nil, fmt.Errorf("unsupported X11 image format (depth %d, %d bits per pixel)", x.rootDepth, x.bpp)
+	}
+	d := off + 40
+	for nd := int(body[off+39]); nd > 0 && d+8 <= len(body); nd-- {
+		nv := int(rd16(body[d+2:]))
+		for d += 8; nv > 0 && d+24 <= len(body); nv, d = nv-1, d+24 {
+			if rd32(body[d:]) == x.visual {
+				x.trueColor = body[d+4] == 4
+				x.rgbMask = [3]uint32{rd32(body[d+8:]), rd32(body[d+12:]), rd32(body[d+16:])}
+			}
+		}
+	}
+	x.waitSeq.Store(1 << 16)
 	x.events = make(chan []byte, 64)
 	x.replies = make(chan []byte, 4)
 	go x.reader()
@@ -3324,11 +3662,15 @@ func (x *x11Conn) newID() uint32 {
 // reader pumps server messages: replies to x.replies, events to x.events.
 func (x *x11Conn) reader() {
 	r := bufio.NewReader(x.c)
+	fail := func(err error) {
+		x.readErr = err
+		close(x.events)
+		close(x.replies)
+	}
 	for {
 		m := make([]byte, 32)
 		if _, err := io.ReadFull(r, m); err != nil {
-			x.readErr = err
-			close(x.events)
+			fail(err)
 			return
 		}
 		switch m[0] {
@@ -3336,15 +3678,18 @@ func (x *x11Conn) reader() {
 			if extra := rd32(m[4:]); extra > 0 {
 				rest := make([]byte, extra*4)
 				if _, err := io.ReadFull(r, rest); err != nil {
-					x.readErr = err
-					close(x.events)
+					fail(err)
 					return
 				}
 				m = append(m, rest...)
 			}
 			x.replies <- m
-		case 0: // protocol error: report and continue
-			fmt.Fprintf(os.Stderr, "X11 error: code=%d major=%d\n", m[1], m[10])
+		case 0: // protocol error: answers a pending round trip, else reported
+			if uint32(rd16(m[2:])) == x.waitSeq.Load() {
+				x.replies <- m
+			} else {
+				fmt.Fprintf(os.Stderr, "X11 error: code=%d major=%d\n", m[1], m[10])
+			}
 		default:
 			x.events <- m
 		}
@@ -3358,10 +3703,15 @@ func (x *x11Conn) send(b []byte) {
 
 func (x *x11Conn) flush() { x.buf.Flush() }
 
-func (x *x11Conn) roundTrip(b []byte) []byte {
+// roundTrip sends a request and waits for its reply; ok is false when the
+// server answered with an error or the connection is gone.
+func (x *x11Conn) roundTrip(b []byte) (r []byte, ok bool) {
 	x.send(b)
+	x.waitSeq.Store(uint32(x.seq))
 	x.flush()
-	return <-x.replies
+	r = <-x.replies
+	x.waitSeq.Store(1 << 16)
+	return r, len(r) >= 32 && r[0] == 1
 }
 
 func (x *x11Conn) internAtom(name string) uint32 {
@@ -3371,7 +3721,10 @@ func (x *x11Conn) internAtom(name string) uint32 {
 	le16(b[2:], uint16(len(b)/4))
 	le16(b[4:], uint16(n))
 	copy(b[8:], name)
-	r := x.roundTrip(b)
+	r, ok := x.roundTrip(b)
+	if !ok {
+		return 0
+	}
 	return rd32(r[8:])
 }
 
@@ -3383,11 +3736,11 @@ func (x *x11Conn) allocColor(rr, gg, bb uint16) (uint32, bool) {
 	le16(b[8:], rr)
 	le16(b[10:], gg)
 	le16(b[12:], bb)
-	r := x.roundTrip(b)
-	if r[0] != 1 {
+	r, ok := x.roundTrip(b)
+	if !ok {
 		return 0, false
 	}
-	return rd32(r[8:]), true
+	return rd32(r[16:]), true
 }
 
 func (x *x11Conn) createWindow(w, h int, evMask uint32) uint32 {
@@ -3446,125 +3799,809 @@ func (x *x11Conn) changeProp8(wid, prop, typ uint32, data string) {
 	x.send(b)
 }
 
-func (x *x11Conn) openFont(name string) uint32 {
-	fid := x.newID()
-	n := len(name)
-	b := make([]byte, 12+n+pad4(n))
-	b[0] = 45
-	le16(b[2:], uint16(len(b)/4))
-	le32(b[4:], fid)
-	le16(b[8:], uint16(n))
-	copy(b[12:], name)
-	x.send(b)
-	return fid
-}
-
-func (x *x11Conn) createGC(drawable, fg, bg, font uint32) uint32 {
+func (x *x11Conn) createGC(drawable, fg, bg uint32) uint32 {
 	gc := x.newID()
-	mask := uint32(0x4 | 0x8) // foreground | background
-	vals := []uint32{fg, bg}
-	if font != 0 {
-		mask |= 0x4000
-		vals = append(vals, font)
-	}
-	b := make([]byte, 16+4*len(vals))
+	b := make([]byte, 24)
 	b[0] = 55
-	le16(b[2:], uint16(len(b)/4))
+	le16(b[2:], 6)
 	le32(b[4:], gc)
 	le32(b[8:], drawable)
-	le32(b[12:], mask)
-	for i, v := range vals {
-		le32(b[16+4*i:], v)
-	}
+	le32(b[12:], 0x4|0x8) // foreground | background
+	le32(b[16:], fg)
+	le32(b[20:], bg)
 	x.send(b)
 	return gc
 }
 
-func (x *x11Conn) setFG(gc, fg uint32) {
-	b := make([]byte, 16)
-	b[0] = 56
-	le16(b[2:], 4)
-	le32(b[4:], gc)
-	le32(b[8:], 0x4)
-	le32(b[12:], fg)
-	x.send(b)
-}
-
-func (x *x11Conn) setBG(gc, bg uint32) {
-	b := make([]byte, 16)
-	b[0] = 56
-	le16(b[2:], 4)
-	le32(b[4:], gc)
-	le32(b[8:], 0x8)
-	le32(b[12:], bg)
-	x.send(b)
-}
-
-func (x *x11Conn) fillRect(d, gc uint32, xx, yy, w, h int) {
-	b := make([]byte, 20)
-	b[0] = 70
-	le16(b[2:], 5)
-	le32(b[4:], d)
-	le32(b[8:], gc)
-	le16(b[12:], uint16(int16(xx)))
-	le16(b[14:], uint16(int16(yy)))
-	le16(b[16:], uint16(w))
-	le16(b[18:], uint16(h))
-	x.send(b)
-}
-
-func (x *x11Conn) drawRect(d, gc uint32, xx, yy, w, h int) {
-	b := make([]byte, 20)
-	b[0] = 67
-	le16(b[2:], 5)
-	le32(b[4:], d)
-	le32(b[8:], gc)
-	le16(b[12:], uint16(int16(xx)))
-	le16(b[14:], uint16(int16(yy)))
-	le16(b[16:], uint16(w))
-	le16(b[18:], uint16(h))
-	x.send(b)
-}
-
-func (x *x11Conn) text(d, gc uint32, xx, yy int, s string) {
-	if len(s) > 255 {
-		s = s[:255]
+// grayLUT maps the 256 gray levels of a frame to pixel values of the root
+// visual; without TrueColor it falls back to black, one gray and white.
+func (x *x11Conn) grayLUT() (lut [256]uint32) {
+	if x.trueColor {
+		for g := range lut {
+			for _, m := range x.rgbMask {
+				if m != 0 {
+					top := uint32(1)<<uint(bits.OnesCount32(m)) - 1
+					lut[g] |= (uint32(g)*top + 127) / 255 << uint(bits.TrailingZeros32(m))
+				}
+			}
+		}
+		return
 	}
-	n := len(s)
-	b := make([]byte, 16+n+pad4(n))
-	b[0] = 76
-	b[1] = byte(n)
-	le16(b[2:], uint16(len(b)/4))
-	le32(b[4:], d)
-	le32(b[8:], gc)
-	le16(b[12:], uint16(int16(xx)))
-	le16(b[14:], uint16(int16(yy)))
-	copy(b[16:], s)
-	x.send(b)
+	gray := x.white
+	if px, ok := x.allocColor(0xb8b8, 0xb8b8, 0xb8b8); ok {
+		gray = px
+	}
+	for g := range lut {
+		switch {
+		case g < 96:
+			lut[g] = x.black
+		case g < 224:
+			lut[g] = gray
+		default:
+			lut[g] = x.white
+		}
+	}
+	return
 }
 
-// guiLoop runs the chess GUI: an 8x8 board window where the human drags (or
-// click-clicks) White's moves, with a button that makes the computer move for
-// the human (the text-mode `c` command). Moves, checks and the result are
-// still printed on stdout exactly like text mode.
-func guiLoop(p *Pos, budget, depthCap int, demo bool) {
+// putGray draws a w x h block of a grayscale frame (rows `stride` apart) at
+// (dx,dy) with ZPixmap PutImage requests no larger than the server allows.
+func (x *x11Conn) putGray(wid, gc uint32, dx, dy, w, h int, src []uint8, stride int, lut *[256]uint32) {
+	bytesPP := x.bpp / 8
+	row := (w*x.bpp + x.pad - 1) / x.pad * x.pad / 8
+	maxRows := max((x.maxReq-24)/row, 1)
+	for y0 := 0; y0 < h; y0 += maxRows {
+		n := min(maxRows, h-y0)
+		b := make([]byte, 24+n*row+pad4(n*row))
+		b[0] = 72
+		b[1] = 2 // ZPixmap
+		le16(b[2:], uint16(len(b)/4))
+		le32(b[4:], wid)
+		le32(b[8:], gc)
+		le16(b[12:], uint16(w))
+		le16(b[14:], uint16(n))
+		le16(b[16:], uint16(dx))
+		le16(b[18:], uint16(dy+y0))
+		b[21] = x.rootDepth
+		for y := 0; y < n; y++ {
+			o := 24 + y*row
+			for _, g := range src[(y0+y)*stride : (y0+y)*stride+w] {
+				v := lut[g]
+				for k := 0; k < bytesPP; k++ {
+					if x.msbFirst {
+						b[o+k] = byte(v >> uint(8*(bytesPP-1-k)))
+					} else {
+						b[o+k] = byte(v >> uint(8*k))
+					}
+				}
+				o += bytesPP
+			}
+		}
+		x.send(b)
+	}
+}
+
+// present sends the 64x64 tiles of frame fb that differ from what the
+// window shows (all of them when shown is nil) and returns the new state.
+func (x *x11Conn) present(wid, gc uint32, fb, shown []uint8, w, h int, lut *[256]uint32) []uint8 {
+	all := shown == nil
+	if all {
+		shown = make([]uint8, len(fb))
+	}
+	for ty := 0; ty < h; ty += 64 {
+		for tx := 0; tx < w; tx += 64 {
+			x0, y0, x1, y1 := w, h, -1, -1
+			for y := ty; y < min(ty+64, h); y++ {
+				for xx := tx; xx < min(tx+64, w); xx++ {
+					if all || fb[y*w+xx] != shown[y*w+xx] {
+						x0, y0, x1, y1 = min(x0, xx), min(y0, y), max(x1, xx), max(y1, y)
+					}
+				}
+			}
+			if x1 >= 0 {
+				x.putGray(wid, gc, x0, y0, x1-x0+1, y1-y0+1, fb[y0*w+x0:], w, lut)
+			}
+		}
+	}
+	copy(shown, fb)
+	x.flush()
+	return shown
+}
+
+// ---------- GUI drawing: grayscale canvas, 8x8 font, piece sprites ----------
+
+type canvas struct {
+	w, h int
+	pix  []uint8
+}
+
+func (c *canvas) fill(x, y, w, h int, g uint8) {
+	x1, y1 := min(x+w, c.w), min(y+h, c.h)
+	x, y = max(x, 0), max(y, 0)
+	for ; y < y1; y++ {
+		for i := x; i < x1; i++ {
+			c.pix[y*c.w+i] = g
+		}
+	}
+}
+
+// frame draws a border of thickness t just inside the given rectangle.
+func (c *canvas) frame(x, y, w, h, t int, g uint8) {
+	c.fill(x, y, w, t, g)
+	c.fill(x, y+h-t, w, t, g)
+	c.fill(x, y+t, t, h-2*t, g)
+	c.fill(x+w-t, y+t, t, h-2*t, g)
+}
+
+// text draws s with its top left corner at (x,y); every font pixel becomes
+// an sx by sy block.
+func (c *canvas) text(x, y int, s string, sx, sy int, g uint8) {
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch < 32 || ch > 126 {
+			ch = '?'
+		}
+		for r, rowBits := range font8[ch-32] {
+			for b := 0; b < 8; b++ {
+				if rowBits>>uint(b)&1 != 0 {
+					c.fill(x+(i*8+b)*sx, y+r*sy, sx, sy, g)
+				}
+			}
+		}
+	}
+}
+
+// sprite is a small grayscale picture with an alpha (coverage) channel.
+type sprite struct {
+	w, h int
+	g, a []uint8
+}
+
+func (c *canvas) blit(s *sprite, x, y int) {
+	for sy := 0; sy < s.h; sy++ {
+		if y+sy < 0 || y+sy >= c.h {
+			continue
+		}
+		for sx := 0; sx < s.w; sx++ {
+			a := int(s.a[sy*s.w+sx])
+			if a == 0 || x+sx < 0 || x+sx >= c.w {
+				continue
+			}
+			d := &c.pix[(y+sy)*c.w+x+sx]
+			*d = uint8((int(*d)*(255-a) + int(s.g[sy*s.w+sx])*a + 127) / 255)
+		}
+	}
+}
+
+// font8 is the public-domain 8x8 VGA font (font8x8_basic by Daniel Hepper),
+// ASCII 32..126, one byte per row, bit 0 = leftmost pixel.
+var font8 = [95][8]byte{
+	{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // ' '
+	{0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00}, // '!'
+	{0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // '"'
+	{0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00}, // '#'
+	{0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00}, // '$'
+	{0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00}, // '%'
+	{0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00}, // '&'
+	{0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00}, // '''
+	{0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00}, // '('
+	{0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00}, // ')'
+	{0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00}, // '*'
+	{0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00}, // '+'
+	{0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06}, // ','
+	{0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00}, // '-'
+	{0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00}, // '.'
+	{0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00}, // '/'
+	{0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00}, // '0'
+	{0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00}, // '1'
+	{0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00}, // '2'
+	{0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00}, // '3'
+	{0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00}, // '4'
+	{0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00}, // '5'
+	{0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00}, // '6'
+	{0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00}, // '7'
+	{0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00}, // '8'
+	{0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00}, // '9'
+	{0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00}, // ':'
+	{0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06}, // ';'
+	{0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00}, // '<'
+	{0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00}, // '='
+	{0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00}, // '>'
+	{0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00}, // '?'
+	{0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00}, // '@'
+	{0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00}, // 'A'
+	{0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00}, // 'B'
+	{0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00}, // 'C'
+	{0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00}, // 'D'
+	{0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00}, // 'E'
+	{0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00}, // 'F'
+	{0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00}, // 'G'
+	{0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00}, // 'H'
+	{0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // 'I'
+	{0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00}, // 'J'
+	{0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00}, // 'K'
+	{0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00}, // 'L'
+	{0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00}, // 'M'
+	{0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00}, // 'N'
+	{0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00}, // 'O'
+	{0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00}, // 'P'
+	{0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00}, // 'Q'
+	{0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00}, // 'R'
+	{0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00}, // 'S'
+	{0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // 'T'
+	{0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00}, // 'U'
+	{0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00}, // 'V'
+	{0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00}, // 'W'
+	{0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00}, // 'X'
+	{0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00}, // 'Y'
+	{0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00}, // 'Z'
+	{0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00}, // '['
+	{0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00}, // '\'
+	{0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00}, // ']'
+	{0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00}, // '^'
+	{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF}, // '_'
+	{0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00}, // '`'
+	{0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00}, // 'a'
+	{0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00}, // 'b'
+	{0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00}, // 'c'
+	{0x38, 0x30, 0x30, 0x3E, 0x33, 0x33, 0x6E, 0x00}, // 'd'
+	{0x00, 0x00, 0x1E, 0x33, 0x3F, 0x03, 0x1E, 0x00}, // 'e'
+	{0x1C, 0x36, 0x06, 0x0F, 0x06, 0x06, 0x0F, 0x00}, // 'f'
+	{0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F}, // 'g'
+	{0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00}, // 'h'
+	{0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // 'i'
+	{0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E}, // 'j'
+	{0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00}, // 'k'
+	{0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // 'l'
+	{0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00}, // 'm'
+	{0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00}, // 'n'
+	{0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00}, // 'o'
+	{0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F}, // 'p'
+	{0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78}, // 'q'
+	{0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00}, // 'r'
+	{0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00}, // 's'
+	{0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00}, // 't'
+	{0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00}, // 'u'
+	{0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00}, // 'v'
+	{0x00, 0x00, 0x63, 0x6B, 0x7F, 0x7F, 0x36, 0x00}, // 'w'
+	{0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00}, // 'x'
+	{0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F}, // 'y'
+	{0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00}, // 'z'
+	{0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00}, // '{'
+	{0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00}, // '|'
+	{0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00}, // '}'
+	{0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // '~'
+}
+
+// letterSprite is the classic look: the FEN letter on a badge - white badge
+// with black ink for White, black badge with white ink for Black.
+func letterSprite(pc, sz int) *sprite {
+	s := &sprite{w: sz, h: sz, g: make([]uint8, sz*sz), a: make([]uint8, sz*sz)}
+	paper, ink := uint8(0), uint8(255)
+	t := -pc
+	if pc > 0 {
+		paper, ink, t = 255, 0, pc
+	}
+	bx, by := sz/2-14, sz/2-16
+	(&canvas{sz, sz, s.a}).fill(bx, by, 28, 32, 255)
+	c := &canvas{sz, sz, s.g}
+	c.fill(bx, by, 28, 32, paper)
+	c.frame(bx, by, 28, 32, 2, ink)
+	c.text(bx+7, by+6, "PNBRQK"[t-1:t], 2, 3, ink)
+	return s
+}
+
+// sdf is a signed distance function: negative inside a shape, positive
+// outside, in units of the 100x100 grid the pieces are designed on.
+type sdf func(x, y float64) float64
+
+func sdCircle(cx, cy, r float64) sdf {
+	return func(x, y float64) float64 { return math.Hypot(x-cx, y-cy) - r }
+}
+
+// sdBox is a rectangle with corners rounded by radius r.
+func sdBox(x0, y0, x1, y1, r float64) sdf {
+	cx, cy, hx, hy := (x0+x1)/2, (y0+y1)/2, (x1-x0)/2-r, (y1-y0)/2-r
+	return func(x, y float64) float64 {
+		qx, qy := math.Abs(x-cx)-hx, math.Abs(y-cy)-hy
+		return math.Hypot(math.Max(qx, 0), math.Max(qy, 0)) + math.Min(math.Max(qx, qy), 0) - r
+	}
+}
+
+func segDist2(x, y, ax, ay, bx, by float64) float64 {
+	ex, ey, wx, wy := bx-ax, by-ay, x-ax, y-ay
+	t := 0.0
+	if l := ex*ex + ey*ey; l > 0 {
+		t = math.Max(0, math.Min(1, (wx*ex+wy*ey)/l))
+	}
+	dx, dy := wx-ex*t, wy-ey*t
+	return dx*dx + dy*dy
+}
+
+// sdPoly is a closed polygon given as x0,y0,x1,y1,...
+func sdPoly(p ...float64) sdf {
+	return func(x, y float64) float64 {
+		d, in := math.Inf(1), false
+		for i, j := 0, len(p)-2; i < len(p); j, i = i, i+2 {
+			ax, ay, bx, by := p[i], p[i+1], p[j], p[j+1]
+			d = math.Min(d, segDist2(x, y, ax, ay, bx, by))
+			if (ay > y) != (by > y) && x < (bx-ax)*(y-ay)/(by-ay)+ax {
+				in = !in
+			}
+		}
+		if in {
+			return -math.Sqrt(d)
+		}
+		return math.Sqrt(d)
+	}
+}
+
+// sdLine is an open polyline drawn with a round pen of half-width hw.
+func sdLine(hw float64, p ...float64) sdf {
+	return func(x, y float64) float64 {
+		d := math.Inf(1)
+		for i := 0; i+3 < len(p); i += 2 {
+			d = math.Min(d, segDist2(x, y, p[i], p[i+1], p[i+2], p[i+3]))
+		}
+		return math.Sqrt(d) - hw
+	}
+}
+
+// chaikin rounds the corners of a closed polygon with n corner-cutting passes.
+func chaikin(n int, p ...float64) []float64 {
+	for ; n > 0; n-- {
+		q := make([]float64, 0, 2*len(p))
+		for i := 0; i < len(p); i += 2 {
+			j := (i + 2) % len(p)
+			q = append(q, 0.75*p[i]+0.25*p[j], 0.75*p[i+1]+0.25*p[j+1],
+				0.25*p[i]+0.75*p[j], 0.25*p[i+1]+0.75*p[j+1])
+		}
+		p = q
+	}
+	return p
+}
+
+// pieceShapes describes a piece (WP..WK) on a 100x100 grid, y down: the
+// union of body is its silhouette, ink are the detail lines inside it.
+func pieceShapes(t int) (body, ink []sdf) {
+	base := sdBox(24, 76, 76, 88, 4)
+	const pen = 1.3
+	switch t {
+	case WP:
+		body = []sdf{base, sdCircle(50, 29, 11), sdBox(37, 40, 63, 47, 3.5),
+			sdPoly(chaikin(2, 44, 44, 41, 55, 34, 66, 30, 78, 70, 78, 66, 66, 59, 55, 56, 44)...)}
+	case WN:
+		body = []sdf{sdBox(24, 77, 80, 88, 4),
+			sdPoly(chaikin(2, 28, 80, 29, 74, 34, 66, 41, 59, 45, 52, 41, 50, 34, 54, 28, 60,
+				21, 62, 15, 57, 14, 49, 18, 42, 25, 33, 33, 24, 38, 17, 39, 7, 39, 7, 46, 14,
+				53, 6, 53, 6, 58, 15, 67, 21, 75, 32, 80, 47, 81, 65, 79, 80)...)}
+		ink = []sdf{sdCircle(32, 34, 2.8), sdLine(pen, 17, 54, 22, 53),
+			sdLine(pen, 60, 22, 68, 30, 73, 42, 75, 56, 75, 70)}
+	case WB:
+		body = []sdf{base, sdCircle(50, 15, 5), sdBox(36, 54, 64, 61, 3.5),
+			sdPoly(chaikin(2, 50, 17, 50, 17, 60, 27, 65, 39, 62, 50, 55, 56, 45, 56, 38, 50, 35, 39, 40, 27)...),
+			sdPoly(chaikin(1, 42, 60, 58, 60, 61, 68, 69, 78, 31, 78, 39, 68)...)}
+		ink = []sdf{sdLine(pen, 57, 27, 49, 41)}
+	case WR:
+		body = []sdf{base,
+			sdPoly(27, 16, 37, 16, 37, 23, 45, 23, 45, 16, 55, 16, 55, 23, 63, 23, 63, 16, 73, 16,
+				73, 33, 66, 41, 66, 68, 72, 77, 28, 77, 34, 68, 34, 41, 27, 33)}
+		ink = []sdf{sdLine(pen, 27, 33, 73, 33), sdLine(pen, 34, 41, 66, 41), sdLine(pen, 34, 68, 66, 68)}
+	case WQ:
+		body = []sdf{base, sdCircle(16, 31, 5), sdCircle(33, 23, 5), sdCircle(50, 20, 5),
+			sdCircle(67, 23, 5), sdCircle(84, 31, 5),
+			sdPoly(28, 78, 17, 34, 31, 55, 33, 26, 42, 53, 50, 23, 58, 53, 67, 26, 69, 55, 83, 34, 72, 78)}
+		ink = []sdf{sdLine(pen, 28, 69, 39, 66, 50, 65, 61, 66, 72, 69)}
+	case WK:
+		body = []sdf{base, sdBox(46.5, 7, 53.5, 32, 1), sdBox(39, 13, 61, 20, 1),
+			sdPoly(chaikin(2, 50, 28, 57, 37, 57, 46, 43, 46, 43, 37)...),
+			sdPoly(chaikin(2, 29, 78, 19, 60, 18, 46, 28, 36, 41, 37, 50, 47, 59, 37, 72, 36, 82, 46,
+				81, 60, 71, 78)...)}
+		ink = []sdf{sdLine(pen, 29, 69, 39, 66, 50, 65, 61, 66, 71, 69), sdLine(pen, 50, 47, 50, 64)}
+	}
+	return
+}
+
+// iconSprite renders a piece icon sz pixels wide: White is white with a
+// black outline, Black is black, both with detail lines in the other color.
+func iconSprite(pc, sz int) *sprite {
+	t := pc
+	if t < 0 {
+		t = -t
+	}
+	body, ink := pieceShapes(t)
+	s := &sprite{w: sz, h: sz, g: make([]uint8, sz*sz), a: make([]uint8, sz*sz)}
+	k := float64(sz) / 100
+	cover := func(d float64) float64 { return math.Max(0, math.Min(1, 0.5-d)) }
+	for y := 0; y < sz; y++ {
+		for x := 0; x < sz; x++ {
+			u, v := (float64(x)+0.5)/k, (float64(y)+0.5)/k
+			d := math.Inf(1)
+			for _, f := range body {
+				d = math.Min(d, f(u, v))
+			}
+			all := cover(d * k)
+			if all == 0 {
+				continue
+			}
+			inner := cover(d*k + 2.2)
+			line := 0.0
+			for _, f := range ink {
+				line = math.Max(line, cover(f(u, v)*k))
+			}
+			white := inner * line
+			if pc > 0 {
+				white = inner * (1 - line)
+			}
+			s.a[y*sz+x] = uint8(all*255 + 0.5)
+			s.g[y*sz+x] = uint8(white/all*255 + 0.5)
+		}
+	}
+	return s
+}
+
+// ---------- GUI state: mouse handling and rendering (no X11 in here) ----------
+
+const (
+	guiSQ      = 64
+	guiBW      = 8 * guiSQ
+	guiStatusH = 40
+	guiBtnH    = 44
+)
+
+const (
+	inputBoth  = iota // click-click and drag & drop
+	inputClick        // click the piece, then the target square
+	inputDrag         // drag the piece and drop it on the target square
+)
+
+type guiOpts struct {
+	icons bool // piece icons instead of letters
+	noCPU bool // no CPU MOVE button
+	input int
+}
+
+type gui struct {
+	p       *Pos
+	opt     guiOpts
+	demo    bool
+	think   func(*Pos) Move
+	out     *bufio.Writer
+	engCh   chan Move
+	w, h    int
+	fb      []uint8 // grayscale frame, w*h
+	sprites [13]*sprite
+
+	sel                int // selected square, -1 = none
+	lastFrom, lastTo   int
+	promoFrom, promoTo int
+	dragFrom           int // square of the piece the mouse holds, -1 = none
+	dragX, dragY       int
+	pressX, pressY     int
+	dragMoved          bool // the held piece has left its place
+	wasSel             bool // the held piece was already selected when pressed
+	pressBtn           bool
+	thinking           bool
+	pendingCPU         int // engine moves left to play in a row (1 reply, 2 for CPU btn)
+	over               bool
+	status             string
+}
+
+func newGUI(p *Pos, opt guiOpts, demo bool, think func(*Pos) Move, out io.Writer) *gui {
+	g := &gui{p: p, opt: opt, demo: demo, think: think, out: bufio.NewWriter(out),
+		engCh: make(chan Move, 1), w: guiBW, h: guiBW + guiStatusH,
+		sel: -1, lastFrom: -1, lastTo: -1, promoFrom: -1, promoTo: -1, dragFrom: -1}
+	if demo || !opt.noCPU {
+		g.h += guiBtnH
+	}
+	g.fb = make([]uint8, g.w*g.h)
+	for pc := BK; pc <= WK; pc++ {
+		if pc == Empty {
+			continue
+		}
+		if opt.icons {
+			g.sprites[pc+6] = iconSprite(pc, guiSQ)
+		} else {
+			g.sprites[pc+6] = letterSprite(pc, guiSQ)
+		}
+	}
+	switch {
+	case demo:
+		g.status = "Demo: engine plays both sides."
+	case opt.input == inputClick:
+		g.status = "You are White: click a piece, then its target."
+	case opt.input == inputDrag:
+		g.status = "You are White: drag a piece to its target."
+	default:
+		g.status = "You are White: drag or click-click a move."
+	}
+	if res, why := gameResult(p); res != "" {
+		fmt.Fprintln(g.out, res+" "+why)
+		g.out.Flush()
+		g.status = res + " " + why
+		g.over = true
+	} else if demo || p.side == Black {
+		g.startEngine(1)
+	}
+	return g
+}
+
+func (g *gui) applyMove(m Move) {
+	g.p.make(m)
+	g.lastFrom, g.lastTo = m.From(), m.To()
+	fmt.Fprintln(g.out, moveStr(m))
+	if res, why := gameResult(g.p); res != "" {
+		fmt.Fprintln(g.out, res+" "+why)
+		g.status = res + " " + why
+		g.over = true
+	} else if g.p.inCheck(g.p.side) {
+		fmt.Fprintln(g.out, "check")
+		g.status = "check!"
+	} else if g.p.side == White && !g.demo {
+		g.status = "Your move."
+	}
+	g.out.Flush()
+}
+
+// startEngine makes the engine play n moves in a row.
+func (g *gui) startEngine(n int) {
+	if g.over || g.thinking {
+		return
+	}
+	g.thinking = true
+	g.pendingCPU = n
+	g.status = "Thinking..."
+	pos := g.p.clone() // the search must not touch the position being displayed
+	go func() { g.engCh <- g.think(pos) }()
+}
+
+func (g *gui) engineMoved(m Move) {
+	g.thinking = false
+	g.pendingCPU--
+	g.applyMove(m)
+	if !g.over && (g.demo || g.pendingCPU > 0) {
+		g.startEngine(max(g.pendingCPU, 1))
+	} else {
+		g.pendingCPU = 0
+	}
+}
+
+func guiSqAt(px, py int) int {
+	if px < 0 || px >= guiBW || py < 0 || py >= guiBW {
+		return -1
+	}
+	return (7-py/guiSQ)*8 + px/guiSQ
+}
+
+func (g *gui) hasBtn() bool { return !g.demo && !g.opt.noCPU }
+
+func (g *gui) inBtn(px, py int) bool {
+	y := guiBW + guiStatusH
+	return g.hasBtn() && px >= 8 && px < g.w-8 && py >= y+2 && py < y+guiBtnH-6
+}
+
+func (g *gui) canMove() bool {
+	return !g.demo && !g.over && !g.thinking && g.p.side == White
+}
+
+// deselect drops the selection, a drag in progress and the promotion chooser.
+func (g *gui) deselect(msg string) {
+	g.sel, g.dragFrom, g.promoFrom, g.promoTo = -1, -1, -1, -1
+	g.status = msg
+}
+
+func (g *gui) humanMove(m Move) {
+	g.sel, g.promoFrom, g.promoTo = -1, -1, -1
+	g.applyMove(m)
+	if !g.over {
+		g.startEngine(1)
+	}
+}
+
+func (g *gui) tryHuman(from, to int) {
+	if !g.canMove() {
+		return
+	}
+	var cands []Move
+	for _, m := range g.p.genLegal() {
+		if m.From() == from && m.To() == to {
+			cands = append(cands, m)
+		}
+	}
+	if len(cands) == 0 {
+		g.deselect("Illegal move.")
+		return
+	}
+	if cands[0].Promo() != 0 {
+		g.sel, g.promoFrom, g.promoTo = from, from, to
+		g.status = "Choose promotion piece (click elsewhere to cancel)."
+		return
+	}
+	g.humanMove(cands[0])
+}
+
+func (g *gui) promoPick(px, py int) {
+	x0, y0 := 2*guiSQ, 3*guiSQ+guiSQ/2
+	if px < x0 || px >= x0+4*guiSQ || py < y0 || py >= y0+guiSQ {
+		g.deselect("Move cancelled.")
+		return
+	}
+	pr := [4]int{WQ, WR, WB, WN}[(px-x0)/guiSQ]
+	for _, m := range g.p.genLegal() {
+		if m.From() == g.promoFrom && m.To() == g.promoTo && m.Promo() == pr {
+			g.humanMove(m)
+			return
+		}
+	}
+}
+
+// press handles a mouse button going down at window position (px,py).
+func (g *gui) press(px, py, button int) {
+	if g.demo {
+		return
+	}
+	if button != 1 {
+		if button == 3 && (g.sel >= 0 || g.promoFrom >= 0) {
+			g.deselect("Move cancelled.")
+		}
+		return
+	}
+	if g.promoFrom >= 0 {
+		g.promoPick(px, py)
+		return
+	}
+	if g.inBtn(px, py) {
+		g.pressBtn = true
+		return
+	}
+	sq := guiSqAt(px, py)
+	if sq < 0 || !g.canMove() {
+		return
+	}
+	if g.p.b[sq] <= 0 { // not an own piece: the target of the selected one
+		if g.sel >= 0 && g.opt.input != inputDrag {
+			g.tryHuman(g.sel, sq)
+		}
+		return
+	}
+	name := sqName(sq)
+	switch g.opt.input {
+	case inputClick:
+		if g.sel == sq {
+			g.deselect("Selection cancelled.")
+			return
+		}
+		g.sel = sq
+		g.status = name + ": click the target square, " + name + " again cancels."
+		return
+	case inputDrag:
+		g.status = name + ": drop it on the target square, back on " + name + " cancels."
+	default:
+		g.status = name + ": drop it or click the target, " + name + " again cancels."
+	}
+	g.wasSel = g.sel == sq
+	g.sel, g.dragFrom, g.dragMoved = sq, sq, false
+	g.pressX, g.pressY, g.dragX, g.dragY = px, py, px, py
+}
+
+// motion handles the mouse moving while a button is down.
+func (g *gui) motion(px, py int) {
+	if g.dragFrom < 0 {
+		return
+	}
+	g.dragX, g.dragY = px, py
+	if dx, dy := px-g.pressX, py-g.pressY; dx*dx+dy*dy > 9 {
+		g.dragMoved = true
+	}
+}
+
+// release handles a mouse button going up at window position (px,py).
+func (g *gui) release(px, py, button int) {
+	if g.demo || button != 1 {
+		return
+	}
+	if g.pressBtn {
+		g.pressBtn = false
+		if g.inBtn(px, py) && g.canMove() {
+			g.deselect("")
+			g.startEngine(2) // the human's move and the reply
+		}
+		return
+	}
+	if g.dragFrom < 0 {
+		return
+	}
+	g.motion(px, py)
+	from := g.dragFrom
+	g.dragFrom = -1
+	if !g.dragMoved { // a plain click on the piece
+		if g.wasSel || g.opt.input == inputDrag {
+			g.deselect("Selection cancelled.")
+		}
+		return
+	}
+	if to := guiSqAt(px, py); to >= 0 && to != from {
+		g.tryHuman(from, to)
+	} else {
+		g.deselect("Move cancelled.")
+	}
+}
+
+// render paints the whole window into g.fb.
+func (g *gui) render() {
+	c := &canvas{g.w, g.h, g.fb}
+	at := func(sq int) (int, int) { return (sq & 7) * guiSQ, (7 - sq>>3) * guiSQ }
+	for sq := 0; sq < 64; sq++ {
+		shade := uint8(255)
+		if (sq&7+sq>>3)&1 == 0 {
+			shade = 0xb8
+		}
+		x, y := at(sq)
+		c.fill(x, y, guiSQ, guiSQ, shade)
+	}
+	for i := 1; i <= 8; i++ {
+		c.fill(i*guiSQ-1, 0, 1, guiBW, 0)
+		c.fill(0, i*guiSQ-1, guiBW, 1, 0)
+	}
+	mark := func(sq, t int) {
+		if sq >= 0 {
+			x, y := at(sq)
+			c.frame(x, y, guiSQ, guiSQ, t, 0)
+		}
+	}
+	mark(g.lastFrom, 2)
+	mark(g.lastTo, 2)
+	mark(g.sel, 4)
+	held := -1
+	if g.dragFrom >= 0 && g.dragMoved {
+		held = g.dragFrom
+	}
+	for sq := 0; sq < 64; sq++ {
+		if pc := g.p.b[sq]; pc != Empty && sq != held {
+			x, y := at(sq)
+			c.blit(g.sprites[pc+6], x, y)
+		}
+	}
+	// status bar and CPU button (no button in demo mode or when hidden)
+	c.fill(0, guiBW, g.w, g.h-guiBW, 255)
+	c.text(8, guiBW+12, g.status, 1, 2, 0)
+	label, y := "", guiBW+guiStatusH
+	if g.hasBtn() {
+		label = "CPU MOVE (plays for you)"
+		c.frame(8, y+2, g.w-15, guiBtnH-7, 2, 0)
+	}
+	if g.thinking && (g.hasBtn() || g.demo) {
+		label = "THINKING..."
+	}
+	c.text(g.w/2-len(label)*4, y+12, label, 1, 2, 0)
+	// promotion chooser overlay
+	if g.promoFrom >= 0 {
+		x0, y0 := 2*guiSQ, 3*guiSQ+guiSQ/2
+		c.fill(x0-8, y0-8, 4*guiSQ+16, guiSQ+16, 255)
+		c.frame(x0-8, y0-8, 4*guiSQ+16, guiSQ+16, 1, 0)
+		for i, pr := range [4]int{WQ, WR, WB, WN} {
+			c.frame(x0+i*guiSQ, y0, guiSQ, guiSQ, 1, 0)
+			c.blit(g.sprites[pr+6], x0+i*guiSQ, y0)
+		}
+	}
+	if held >= 0 { // the piece being dragged follows the pointer
+		c.blit(g.sprites[g.p.b[held]+6], g.dragX-guiSQ/2, g.dragY-guiSQ/2)
+	}
+}
+
+// guiLoop runs the chess GUI: an 8x8 board window where the human moves
+// White's pieces by drag & drop or click-click, with an optional button that
+// makes the computer move for the human (the text-mode `c` command). Moves,
+// checks and the result are still printed on stdout exactly like text mode.
+func guiLoop(p *Pos, budget time.Duration, depthCap int, demo bool, opt guiOpts) {
 	x, err := x11Dial()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gui: cannot open X display:", err)
 		os.Exit(1)
 	}
-	const (
-		SQ      = 64
-		BW      = 8 * SQ
-		statusY = BW
-		statusH = 40
-		btnY    = BW + statusH
-		btnH    = 44
-		WinW    = BW
-		WinH    = BW + statusH + btnH
-	)
-	evMask := uint32(1<<2 | 1<<3 | 1<<15 | 1<<17) // press, release, exposure, structure
-	win := x.createWindow(WinW, WinH, evMask)
+	g := newGUI(p, opt, demo, func(q *Pos) Move { return bestMove(q, budget, depthCap) }, os.Stdout)
+	// press, release, motion with a button down, exposure, structure
+	win := x.createWindow(g.w, g.h, 1<<2|1<<3|1<<13|1<<15|1<<17)
 	x.changeProp8(win, 39, 31, "chess-fable") // WM_NAME
 	wmProtocols := x.internAtom("WM_PROTOCOLS")
 	wmDelete := x.internAtom("WM_DELETE_WINDOW")
@@ -3572,297 +4609,48 @@ func guiLoop(p *Pos, budget, depthCap int, demo bool) {
 	// lock the window size (PMinSize|PMaxSize)
 	hints := make([]uint32, 18)
 	hints[0] = 16 | 32
-	hints[5], hints[6] = WinW, WinH
-	hints[7], hints[8] = WinW, WinH
+	hints[5], hints[6] = uint32(g.w), uint32(g.h)
+	hints[7], hints[8] = uint32(g.w), uint32(g.h)
 	x.changeProp32(win, 40, 41, hints) // WM_NORMAL_HINTS / WM_SIZE_HINTS
-	gray := x.white
-	if px, ok := x.allocColor(0xb8b8, 0xb8b8, 0xb8b8); ok {
-		gray = px
-	}
-	font := x.openFont("10x20")
-	gc := x.createGC(win, x.black, x.white, font)
+	gc := x.createGC(win, x.black, x.white)
+	lut := x.grayLUT()
 	x.mapWindow(win)
 	x.flush()
 
-	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
-	sel := -1
-	lastFrom, lastTo := -1, -1
-	thinking := false
-	pendingCPU := 0 // engine moves left to play in a row (1 reply, 2 for CPU btn)
-	over := false
-	status := "You are White: drag or click-click a move."
-	if demo {
-		status = "Demo: engine plays both sides."
-	}
-	promoFrom, promoTo := -1, -1
-	pressSq, pressBtn := -1, false
-	engCh := make(chan Move, 1)
-
-	if res, why := gameResult(p); res != "" {
-		fmt.Fprintln(out, res+" "+why)
-		out.Flush()
-		status = res + " " + why
-		over = true
-	}
-
-	sqAt := func(px, py int) int {
-		if px < 0 || px >= BW || py < 0 || py >= BW {
-			return -1
-		}
-		return (7-py/SQ)*8 + px/SQ
-	}
-	inBtn := func(px, py int) bool {
-		return px >= 8 && px < WinW-8 && py >= btnY+2 && py < btnY+btnH-6
-	}
-
-	pieceGlyph := func(pc int) (byte, bool) { // letter, isWhite
-		if pc > 0 {
-			return "PNBRQK"[pc-1], true
-		}
-		return "PNBRQK"[-pc-1], false
-	}
-
-	draw := func() {
-		// board squares
-		for r := 0; r < 8; r++ {
-			for f := 0; f < 8; f++ {
-				xx, yy := f*SQ, (7-r)*SQ
-				if (f+r)&1 == 0 {
-					x.setFG(gc, gray)
-				} else {
-					x.setFG(gc, x.white)
-				}
-				x.fillRect(win, gc, xx, yy, SQ, SQ)
-			}
-		}
-		// grid + last-move + selection markers
-		x.setFG(gc, x.black)
-		for i := 0; i <= 8; i++ {
-			x.fillRect(win, gc, i*SQ-1, 0, 1, BW)
-			x.fillRect(win, gc, 0, i*SQ-1, BW, 1)
-		}
-		mark := func(sq int, w int) {
-			if sq < 0 {
-				return
-			}
-			f, r := sq&7, sq>>3
-			for i := 0; i < w; i++ {
-				x.drawRect(win, gc, f*SQ+i, (7-r)*SQ+i, SQ-1-2*i, SQ-1-2*i)
-			}
-		}
-		x.setFG(gc, x.black)
-		mark(lastFrom, 2)
-		mark(lastTo, 2)
-		mark(sel, 4)
-		// pieces: letter on a round-ish badge - white badge/black ink for
-		// White, black badge/white ink for Black (readable on any square)
-		for sq := 0; sq < 64; sq++ {
-			pc := p.b[sq]
-			if pc == Empty {
-				continue
-			}
-			g, isW := pieceGlyph(pc)
-			s := string(g)
-			f, r := sq&7, sq>>3
-			bx, by := f*SQ+SQ/2-14, (7-r)*SQ+SQ/2-16
-			fill, ink := x.black, x.white
-			if isW {
-				fill, ink = x.white, x.black
-			}
-			x.setFG(gc, fill)
-			x.fillRect(win, gc, bx, by, 28, 32)
-			x.setFG(gc, ink)
-			x.drawRect(win, gc, bx, by, 27, 31)
-			x.drawRect(win, gc, bx+1, by+1, 25, 29)
-			x.setBG(gc, fill)
-			cx, cy := f*SQ+SQ/2-5, (7-r)*SQ+SQ/2+7
-			x.text(win, gc, cx, cy, s)
-			x.text(win, gc, cx+1, cy, s) // fake bold
-			x.setBG(gc, x.white)
-		}
-		// status bar
-		x.setFG(gc, x.white)
-		x.fillRect(win, gc, 0, statusY, WinW, statusH+btnH)
-		x.setFG(gc, x.black)
-		x.text(win, gc, 8, statusY+26, status)
-		// CPU button (hidden in demo mode - the engine plays itself)
-		if !demo {
-			label := "CPU MOVE (plays for you)"
-			if thinking {
-				label = "THINKING..."
-			}
-			x.drawRect(win, gc, 8, btnY+2, WinW-16, btnH-8)
-			x.drawRect(win, gc, 9, btnY+3, WinW-18, btnH-10)
-			x.text(win, gc, WinW/2-len(label)*10/2, btnY+btnH/2+4, label)
-		} else if thinking {
-			x.text(win, gc, WinW/2-55, btnY+btnH/2+4, "THINKING...")
-		}
-		// promotion chooser overlay
-		if promoFrom >= 0 {
-			x.setFG(gc, x.white)
-			x.fillRect(win, gc, 2*SQ-8, 3*SQ+SQ/2-8, 4*SQ+16, SQ+16)
-			x.setFG(gc, x.black)
-			x.drawRect(win, gc, 2*SQ-8, 3*SQ+SQ/2-8, 4*SQ+15, SQ+15)
-			for i, c := range "QRBN" {
-				xx, yy := (2+i)*SQ, 3*SQ+SQ/2
-				x.drawRect(win, gc, xx, yy, SQ-1, SQ-1)
-				x.text(win, gc, xx+SQ/2-5, yy+SQ/2+7, string(c))
-			}
-		}
-		x.flush()
-	}
-
-	applyMove := func(m Move) {
-		p.make(m)
-		lastFrom, lastTo = m.From, m.To
-		fmt.Fprintln(out, moveStr(m))
-		if res, why := gameResult(p); res != "" {
-			fmt.Fprintln(out, res+" "+why)
-			status = res + " " + why
-			over = true
-		} else if p.inCheck(p.side) {
-			fmt.Fprintln(out, "check")
-			status = "check!"
-		} else if p.side == White && !demo {
-			status = "Your move."
-		}
-		out.Flush()
-	}
-
-	startEngine := func(n int) { // n engine moves in a row
-		if over || thinking {
-			return
-		}
-		thinking = true
-		pendingCPU = n
-		status = "Thinking..."
-		go func() { engCh <- bestMove(p, budget, depthCap) }()
-	}
-
-	tryHuman := func(from, to int) {
-		if over || thinking || p.side != White {
-			return
-		}
-		var cands []Move
-		for _, m := range p.genLegal() {
-			if m.From == from && m.To == to {
-				cands = append(cands, m)
-			}
-		}
-		if len(cands) == 0 {
-			status = "Illegal move."
-			return
-		}
-		if cands[0].Promo != 0 {
-			promoFrom, promoTo = from, to
-			status = "Choose promotion piece."
-			return
-		}
-		sel = -1
-		applyMove(cands[0])
-		if !over {
-			startEngine(1)
-		}
-	}
-
-	promoPick := func(px, py int) {
-		if py < 3*SQ+SQ/2 || py >= 3*SQ+SQ/2+SQ || px < 2*SQ || px >= 6*SQ {
-			return // click outside: keep chooser open
-		}
-		promos := [4]int{WQ, WR, WB, WN}
-		pr := promos[(px-2*SQ)/SQ]
-		for _, m := range p.genLegal() {
-			if m.From == promoFrom && m.To == promoTo && m.Promo == pr {
-				promoFrom, promoTo = -1, -1
-				sel = -1
-				applyMove(m)
-				if !over {
-					startEngine(1)
-				}
-				return
-			}
-		}
-	}
-
-	if demo && !over {
-		startEngine(1) // demo: the engine opens as White and never stops
-	}
-
+	var shown []uint8 // what the window displays; nil = repaint everything
+	dirty := false
 	for {
 		select {
-		case m := <-engCh:
-			thinking = false
-			pendingCPU--
-			applyMove(m)
-			if !over && (demo || pendingCPU > 0) {
-				startEngine(max(pendingCPU, 1))
-			} else {
-				pendingCPU = 0
-			}
-			draw()
+		case m := <-g.engCh:
+			g.engineMoved(m)
+			dirty = true
 		case ev, ok := <-x.events:
 			if !ok {
 				return // display gone
 			}
+			px, py := int(int16(rd16(ev[24:]))), int(int16(rd16(ev[26:])))
 			switch ev[0] & 0x7f {
 			case 12: // Expose
-				if rd16(ev[16:]) == 0 {
-					draw()
-				}
+				shown, dirty = nil, true
 			case 4: // ButtonPress
-				if demo {
-					break // demo: board is not interactive
-				}
-				px, py := int(int16(rd16(ev[24:]))), int(int16(rd16(ev[26:])))
-				if promoFrom >= 0 {
-					promoPick(px, py)
-					draw()
-					break
-				}
-				pressSq = sqAt(px, py)
-				pressBtn = inBtn(px, py)
+				g.press(px, py, int(ev[1]))
+				dirty = true
 			case 5: // ButtonRelease
-				if demo {
-					break
-				}
-				px, py := int(int16(rd16(ev[24:]))), int(int16(rd16(ev[26:])))
-				if promoFrom >= 0 {
-					break
-				}
-				if pressBtn && inBtn(px, py) {
-					pressBtn = false
-					if !over && !thinking && p.side == White {
-						startEngine(2) // your move + the reply
-					}
-					draw()
-					break
-				}
-				pressBtn = false
-				rel := sqAt(px, py)
-				if rel < 0 || pressSq < 0 {
-					break
-				}
-				if rel == pressSq { // click-click mode
-					if sel >= 0 && rel != sel {
-						tryHuman(sel, rel)
-					} else if p.b[rel] > 0 && p.side == White && !thinking && !over {
-						sel = rel
-						status = "Now click the destination square."
-					} else {
-						sel = -1
-					}
-				} else { // drag
-					tryHuman(pressSq, rel)
-					sel = -1
-				}
-				pressSq = -1
-				draw()
+				g.release(px, py, int(ev[1]))
+				dirty = true
+			case 6: // MotionNotify
+				g.motion(px, py)
+				dirty = true
 			case 33: // ClientMessage (window close)
 				if rd32(ev[12:]) == wmDelete {
 					return
 				}
 			}
+		}
+		if dirty && len(x.events) == 0 { // repaint once per burst of events
+			g.render()
+			shown = x.present(win, gc, g.fb, shown, g.w, g.h, &lut)
+			dirty = false
 		}
 	}
 }

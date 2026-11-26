@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"math/bits"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -27,6 +29,7 @@ func TestMain(m *testing.M) {
 	initZobrist()
 	initMasks()
 	initLMR()
+	nnOnce.Do(nnInit)
 	os.Exit(m.Run())
 }
 
@@ -448,6 +451,91 @@ func TestSearchKnowsDeadDraws(t *testing.T) {
 	}
 }
 
+// The quiescence search tries captures only: a king left without a move
+// must not look lost to it, or a search of depth 1 stalemates bare kings.
+func TestStalemateSeen(t *testing.T) {
+	for fen, want := range map[string]bool{
+		"7k/5Q2/6K1/8/8/8/8/8 b - - 0 1":    true,
+		"7k/8/6K1/8/8/8/8/5Q2 b - - 0 1":    false,
+		"k7/P7/K7/8/8/8/8/8 b - - 0 1":      true,  // the pawn is defended
+		"k7/1R6/2K5/8/8/8/8/8 b - - 0 1":    true,  // so is the rook
+		"k7/1R6/8/8/8/8/7P/7K b - - 0 1":    false, // this one is not
+		"7k/5Q1p/7P/8/8/8/8/6K1 b - - 0 1":  true,  // a blocked pawn
+		"7k/5Q1p/8/7P/8/8/8/6K1 b - - 0 1":  false, // a pawn that moves
+		"7k/5Q1p/6BP/8/8/8/8/6K1 b - - 0 1": false, // a pawn that takes
+		"8/8/8/8/8/5k2/5p2/5K2 w - - 0 1":   true,
+	} {
+		e := &Engine{p: fromFEN(fen), ctl: &searchCtl{}}
+		if got, legal := e.p.stalemated(), len(e.p.genLegal()); got != want || want != (legal == 0) {
+			t.Errorf("%s: stalemated %v, want %v, %d legal moves", fen, got, want, legal)
+		}
+		if q := e.quiesce(-Inf, Inf, 1); want != (q == 0) {
+			t.Errorf("%s: quiescence %d, stalemate %v", fen, q, want)
+		}
+	}
+	// a bare king against king, queen and rook anywhere: exact
+	rng := rand.New(rand.NewSource(5))
+	for n, stale := 0, 0; n < 20000; {
+		sq := rng.Perm(64)[:4]
+		p := &Pos{ep: -1, side: Black}
+		p.set(BK, sq[0])
+		p.set(WK, sq[1])
+		p.set(WQ, sq[2])
+		p.set(WR, sq[3])
+		p.kingSq = [2]int{sq[1], sq[0]}
+		if chebDist(sq[0], sq[1]) < 2 || p.inCheck(Black) {
+			continue
+		}
+		p.hash = p.computeHash()
+		p.hist = append(p.hist, p.hash)
+		got, want := p.stalemated(), len(p.genLegal()) == 0
+		if got != want {
+			t.Fatalf("%s: stalemated %v, want %v", toFEN(p), got, want)
+		}
+		if n, stale = n+1, stale+b2i(want); n == 20000 && stale < 100 {
+			t.Errorf("only %d stalemates in %d positions", stale, n)
+		}
+	}
+	// depth 1 used to play Kg3 here
+	fen := "8/8/8/8/P4K2/5Q2/8/6k1 w - - 19 71"
+	p := fromFEN(fen)
+	p.make(bestMove(fromFEN(fen), 0, 1))
+	if len(p.genLegal()) == 0 && !p.inCheck(p.side) {
+		t.Errorf("%s: stalemated the bare king at depth 1", fen)
+	}
+}
+
+// For the search a position is a draw when it comes again within the lines
+// it looks at, or for the third time in the game. Coming again once in the
+// game is not, where the search goes on: the opponent, who missed a capture
+// there, may see it now.
+func TestSearchRepetition(t *testing.T) {
+	play := func(p *Pos, moves string) {
+		for _, s := range strings.Fields(moves) {
+			m, msg := parseMove(p, s, p.genLegal())
+			if msg != "" {
+				t.Fatalf("%s: %s", s, msg)
+			}
+			p.make(m)
+		}
+	}
+	p := startPos()
+	e := &Engine{p: p}
+	play(p, "g1f3 g8f6 f3g1 f6g8") // the start position again
+	if a, b, c, d := e.isRepetition(1, 1), e.isRepetition(4, 1), e.isRepetition(5, 1), e.isRepetition(1, 0); a || b || !c || !d {
+		t.Errorf("second occurrence, 1, 4, 5 plies into the search and 1 at its end: %v %v %v %v, want false false true true", a, b, c, d)
+	}
+	play(p, "g1f3 g8f6 f3g1 f6g8")
+	if !e.isRepetition(1, 1) {
+		t.Errorf("third occurrence: no draw")
+	}
+	p = fromFEN("8/8/8/6rk/5K2/8/8/6R1 w - - 0 1") // White could take the rook
+	play(p, "g1c1 g5b5 c1g1")
+	if got := moveStr(bestMove(p, 0, 6)); got == "b5g5" {
+		t.Errorf("played %s, back into the position where the rook is lost", got)
+	}
+}
+
 // Bishop and knight mate only in a corner of the bishop's color: the
 // evaluation must want the bare king there, the same for both sides.
 func TestBishopAndKnightCorner(t *testing.T) {
@@ -511,6 +599,253 @@ func TestMoveOrderingKeepsEveryMove(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// The quiet moves left when the search prunes them: those that give check
+// from the square they go to, in their order, then the moves that followed.
+func TestChecksOnly(t *testing.T) {
+	for _, fen := range []string{
+		"r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+		"6k1/5ppp/8/8/8/2B2N2/5PPP/R2Q2K1 w - - 0 1",
+		"4k3/8/8/8/8/8/3PP3/RN1QKB1R w KQ - 0 1",
+		"r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 b - - 0 10",
+	} {
+		p := fromFEN(fen)
+		e := &Engine{p: p}
+		all := p.genPseudo(false)
+		qs, qe := e.orderCaptures(all)
+		want := append([]Move(nil), all[:qs]...)
+		for _, m := range all[qs:qe] {
+			u := p.make(m) // the man now on m.To() attacks the king?
+			to, k, occ := m.To(), uint(p.kingSq[p.side]), p.occ[White]|p.occ[Black]
+			var att uint64
+			switch abs(p.b[to]) {
+			case WP:
+				att = pawnAttBB[p.side^1][to]
+			case WN:
+				att = knightBB[to]
+			case WB:
+				att = bishopAtt(to, occ)
+			case WR:
+				att = rookAtt(to, occ)
+			case WQ:
+				att = bishopAtt(to, occ) | rookAtt(to, occ)
+			}
+			p.unmake(m, u)
+			if att>>k&1 != 0 {
+				want = append(want, m)
+			}
+		}
+		nq := len(want)
+		want = append(want, all[qe:]...)
+		got, gqe := p.checksOnly(append([]Move(nil), all...), qs, qe)
+		if gqe != nq || fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s: %d moves, checks end at %d; want %d, %d", fen, len(got), gqe, len(want), nq)
+		}
+	}
+}
+
+// ---------- evaluation network ----------
+
+// nnPlain computes the output of the network without the tricks on words:
+// every hidden unit is summed, clipped and weighted by itself.
+func nnPlain(p *Pos) int {
+	nw, nb := nn.nw, nn.nb
+	lane := func(w []uint64, i int) int { return int(w[i/4] >> uint(16*(i&3)) & 0xFFFF) }
+	bkt := min((bits.OnesCount64(p.occ[White]|p.occ[Black])-2)/4, nb-1)
+	sum := int(nn.ob[bkt])
+	for v := 0; v < 2; v++ { // the side to move, then the other side
+		c := p.side ^ v
+		feat := &nn.feat[c][p.kingSq[c]>>2&1]
+		for u := 0; u < 4*nw; u++ {
+			h := lane(nn.fb, u) - nnZero
+			for sq, pc := range p.b {
+				if pc != Empty {
+					h += lane(nn.ft[int(feat[pieceIdx(pc)*64+sq])*nw:], u) - nnWZero
+				}
+			}
+			if h >= 0 {
+				sum += min(h>>2, 63) * (int(nn.ow[(bkt*2+v)*nw+u/4]>>uint(16*(3-u&3))&0xFFFF) - 128)
+			}
+		}
+		for sq, pc := range p.b {
+			if pc != Empty {
+				sum += (1 - 2*v) * int(nn.pq[int(feat[pieceIdx(pc)*64+sq])*nb+bkt])
+			}
+		}
+	}
+	return sum * nn.k / 4096
+}
+
+// transformed returns p with every man on square f(sq); with swap the
+// colors and the side to move change too.
+func transformed(p *Pos, f func(int) int, swap bool) *Pos {
+	q := &Pos{ep: -1, side: p.side}
+	for sq, pc := range p.b {
+		if pc == Empty {
+			continue
+		}
+		if swap {
+			pc = -pc
+		}
+		q.set(pc, f(sq))
+		if pc == WK {
+			q.kingSq[White] = f(sq)
+		} else if pc == BK {
+			q.kingSq[Black] = f(sq)
+		}
+	}
+	if swap {
+		q.side ^= 1
+	}
+	q.hash = q.computeHash()
+	q.pawnKey = q.computePawnKey()
+	q.hist = append(q.hist, q.hash)
+	return q
+}
+
+// The hidden units kept up to date move by move, and only when an
+// evaluation asks for them, are those computed from the board; the output
+// computed on words is the plain sum; a position with the colors swapped
+// or mirrored left to right has the same value.
+func TestNetwork(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	var s, fresh nnStack
+	nw, nb := nn.nw, nn.nb
+	fresh.v, fresh.ps = make([]uint64, 2*nw), make([]int32, 2*nb)
+	checks := 0
+	var walk func(p *Pos, depth int)
+	walk = func(p *Pos, depth int) {
+		if rng.Intn(3) > 0 {
+			j := s.cur(p)
+			fresh.refresh(p, 0, White)
+			fresh.refresh(p, 0, Black)
+			for i, x := range fresh.v {
+				if got := s.v[2*j*nw+i]; got != x || got&0x8000800080008000 != 0 {
+					t.Fatalf("%s: hidden units %d: %016x, from the board %016x", toFEN(p), i, got, x)
+				}
+			}
+			for i, x := range fresh.ps {
+				if got := s.ps[2*j*nb+i]; got != x {
+					t.Fatalf("%s: sum %d: %d, from the board %d", toFEN(p), i, got, x)
+				}
+			}
+			if checks++; checks%50 == 0 {
+				want := p.nnEval()
+				if got := nnPlain(p); got != want {
+					t.Fatalf("%s: plain sum %d, on words %d", toFEN(p), got, want)
+				}
+				flip := transformed(p, func(sq int) int { return sq ^ 56 }, true)
+				mirror := transformed(p, func(sq int) int { return sq ^ 7 }, false)
+				if a, b := flip.eval(), mirror.eval(); a != p.eval() || b != p.eval() {
+					t.Fatalf("%s: %d, colors swapped %d, mirrored %d", toFEN(p), p.eval(), a, b)
+				}
+			}
+		}
+		if depth == 0 {
+			return
+		}
+		legal := p.genLegal()
+		for k := 0; k < 2 && len(legal) > 0; k++ {
+			m := legal[rng.Intn(len(legal))]
+			u := p.make(m)
+			walk(p, depth-1)
+			p.unmake(m, u)
+		}
+	}
+	for g := 0; g < 200; g++ {
+		p := startPos()
+		for i := rng.Intn(150); i > 0; i-- {
+			legal := p.genLegal()
+			if len(legal) == 0 {
+				break
+			}
+			p.make(legal[rng.Intn(len(legal))])
+		}
+		q := p.clone()
+		q.nnAttach(&s)
+		walk(q, 8)
+		if s.at != 0 {
+			t.Fatalf("stack not back at the root: %d", s.at)
+		}
+	}
+	if checks < 50000 {
+		t.Fatalf("only %d checks", checks)
+	}
+}
+
+// The network counts the material.
+func TestNetworkKnowsMaterial(t *testing.T) {
+	for _, c := range []struct {
+		fen    string
+		lo, hi int
+	}{
+		{"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", -60, 100},
+		{"rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 500, 2500},
+		{"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/R1BQKBNR w KQkq - 0 1", -600, -120},
+		{"4k3/8/8/8/8/8/8/R3K3 b - - 0 1", -3000, -300},
+	} {
+		if v := fromFEN(c.fen).eval(); v < c.lo || v > c.hi {
+			t.Errorf("%s: %d, want %d..%d", c.fen, v, c.lo, c.hi)
+		}
+	}
+}
+
+// King and pawn against king is known exactly; against a bare king more
+// material is worth more, and what cannot be won is worth nothing much.
+func TestKnownEndings(t *testing.T) {
+	kpkOnce.Do(kpkInit)
+	wins := 0
+	for _, w := range kpkWins {
+		wins += bits.OnesCount64(w)
+	}
+	if wins != 111282 {
+		t.Errorf("king and pawn against king: %d won positions, want 111282", wins)
+	}
+	ev := func(fen string) int { return fromFEN(fen).eval() }
+	for fen, won := range map[string]bool{
+		"4k3/8/4K3/4P3/8/8/8/8 w - - 0 1": true, // king on the sixth rank in front of the pawn
+		"4k3/8/4K3/4P3/8/8/8/8 b - - 0 1": true,
+		"8/4k3/8/4K3/4P3/8/8/8 w - - 0 1": false, // Black has the opposition
+		"8/4k3/8/4K3/4P3/8/8/8 b - - 0 1": true,
+		"k7/8/1K6/P7/8/8/8/8 w - - 0 1":   false, // rook pawn
+		"8/8/4k3/8/8/8/4P3/4K3 w - - 0 1": false, // the black king keeps the opposition
+		"4k3/4P3/4K3/8/8/8/8/8 b - - 0 1": false, // stalemate
+		"4k3/4P3/4K3/8/8/8/8/8 w - - 0 1": true,
+		"8/8/8/8/8/2k5/2p5/2K5 b - - 0 1": true,
+		"8/8/8/8/8/2k5/2p5/2K5 w - - 0 1": false, // stalemate
+	} {
+		if v := ev(fen); won != (v >= nnWon || v <= -nnWon) || !won && v != 0 {
+			t.Errorf("%s: %d, won %v", fen, v, won)
+		}
+	}
+	for _, c := range [][2]string{ // the second is worth more to White than the first
+		{"k7/8/8/8/8/8/8/KNN5 w - - 0 1", "4k3/8/4K3/4P3/8/8/8/8 w - - 0 1"},
+		{"4k3/4P3/4K3/8/8/8/8/8 w - - 0 1", "4k3/8/8/8/8/8/8/R3K3 w - - 0 1"},
+		{"4k3/8/8/8/8/8/8/1N2KB2 w - - 0 1", "4k3/8/8/8/8/8/P7/1N2KB2 w - - 0 1"},
+		{"4k3/8/8/8/8/8/8/R3K3 w - - 0 1", "4k3/8/8/8/8/8/P7/R3K3 w - - 0 1"},
+		{"4k3/8/8/8/8/8/8/R3K3 w - - 0 1", "4k3/8/8/8/8/8/8/3QK3 w - - 0 1"},
+		{"4k3/8/8/8/8/8/8/3QK3 w - - 0 1", "4k3/8/8/8/8/8/8/R2QK3 w - - 0 1"},
+	} {
+		if a, b := ev(c[0]), ev(c[1]); a >= b {
+			t.Errorf("%s: %d, %s: %d", c[0], a, c[1], b)
+		}
+	}
+	for _, fen := range []string{
+		"k7/8/8/8/P7/8/P7/K7 w - - 0 1",  // two rook pawns, the king in the corner
+		"7k/8/8/8/8/8/7P/5B1K w - - 0 1", // h-pawn and light bishop
+		"k7/8/8/8/8/8/P7/K1B5 w - - 0 1", // a-pawn and dark bishop
+	} {
+		if v := ev(fen); v < 0 || v > 50 {
+			t.Errorf("%s: %d, want a draw", fen, v)
+		}
+	}
+	if v := ev("7k/8/8/8/8/8/7P/4B2K w - - 0 1"); v < nnWon { // the bishop controls h8
+		t.Errorf("h-pawn and dark bishop: %d", v)
+	}
+	if a, b := ev("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"), ev("4k3/8/8/8/8/8/8/R3K3 b - - 0 1"); a != -b {
+		t.Errorf("rook against king: %d for White, %d for Black", a, b)
 	}
 }
 

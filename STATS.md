@@ -195,3 +195,155 @@ New in the repository: `chess_test.go` (GUI state machine, rendering,
 command line, rules, memory sizing, search and - on a private Xvfb with the
 real pointer - the program end to end on 24-, 16- and 8-bit displays) and a
 `Makefile`. Tests and binaries were run on FreeBSD, Linux and macOS.
+
+## v5 — a neural network evaluates, trained on its own games (2026-11-26)
+
+Model: Claude Fable 5.2 (claude-fable-5.2) via GitHub Copilot CLI, one day
+on the FreeBSD host, shared with other jobs, and four hours of an M1 Mac
+for a quarter of the games, the last training and two matches. Requests:
+"make it as smart/hard-to-beat as possible keeping current work modes"
+and, on the way, "make sure it is not worse in any case than the current
+version".
+
+What changed:
+- **Evaluation**: the hand-written evaluation (piece-square tables, pawn
+  structure, mobility, king safety, threats) is gone. A network takes its
+  place: for each side 768 inputs (own or enemy man, type, square, the
+  board mirrored when that side's king is on the files e-h), 256 hidden
+  units per side, one output with 8 sets of weights by the number of men
+  and a value for every man.
+- **Its arithmetic** is what a single Go file without assembly can do
+  fast: hidden units are 16-bit lanes, four to a 64-bit word, stored with
+  an offset so that whole-word additions update four units at once; the
+  output takes 6 bits of each unit and 8-bit weights, and one 64-bit
+  multiplication is the dot product of four units. Speed on one thread,
+  80 positions to depth 11: 1.8M nodes/s against 2.1M with the
+  hand-written evaluation on the FreeBSD host, 1.9M against 2.5M on the M1
+  (a plain 16-bit loop would have halved it).
+- **Its training** used nothing but the program: 649,825 games against
+  itself (about 3,800 nodes a move, 80 hours of processor time), 57.7
+  million positions, each with the score of its search and the result of
+  its game. Four generations: v4 taught the first network, each network
+  the next. The trainer is a Go program too (`nnue/`), half an hour for
+  the last run. The weights are compiled in: the last 270 KB of
+  `chess.go`, no file to carry around.
+- **Where the network is not asked**: king and pawn against king is an
+  exact table (111,282 won positions, built in 20 ms at startup); pieces
+  against a bare king are scored by the known way to the mate; positions
+  the network scores above 1000 are scored by material and progress, on
+  one scale with the two before, so that a won game goes forward.
+- **Search**: quiet moves that give check directly are never dropped by
+  futility or late move pruning (+35 ± 16 Elo at 25,000 nodes a move, no
+  difference found at 100,000; mates found in 290 forced-mate positions
+  at depth 7: 204 instead of 131). The quiescence search knows the
+  stalemate of a king with pawns at most. A position that has occurred
+  once in the game is no longer a draw wherever the search meets it, only
+  where the search ends; inside the tree it takes the third occurrence,
+  or a repetition within the line searched.
+
+Final against v4 (the committed program, `a84ae2c`), the same limit for
+both, each opening twice with the colors swapped, 1 thread unless said
+otherwise, python-chess as the referee:
+
+| limit for both | games | result | score | Elo |
+|---|---|---|---|---|
+| depth 1 | 400 | +267 =29 −104 | 70.4% | **+150 ± 36** |
+| depth 2 | 400 | +294 =32 −74 | 77.5% | **+215 ± 39** |
+| depth 4 | 400 | +312 =33 −55 | 82.1% | **+265 ± 42** |
+| depth 6 | 400 | +319 =51 −30 | 86.1% | **+317 ± 43** |
+| depth 8 | 400 | +327 =43 −30 | 87.1% | **+332 ± 45** |
+| depth 10 | 200 | +168 =23 −9 | 89.8% | **+377 ± 68** |
+| 0.01 s/move | 400 | +310 =52 −38 | 84.0% | **+288 ± 41** |
+| 0.1 s/move | 400 | +306 =65 −29 | 84.6% | **+296 ± 40** |
+| 1 s/move | 48 | +40 =7 −1 | 90.6% | **+394** (95%: above +293) |
+| 5 s/move (on the M1) | 21 | +17 =2 −2 | 85.7% | **+311** (95%: above +167) |
+| 4 threads each, 0.2 s/move | 60 | +46 =12 −2 | 86.7% | **+325** (95%: above +243) |
+| 8 threads each, 0.5 s/move (on the M1) | 30 | +26 =3 −1 | 91.7% | **+417** (95%: above +282) |
+| 16 threads each, 0.3 s/move | 20 | +14 =6 −0 | 85.0% | **+301** (95%: above +190) |
+| RAM mode (limit `0`), 4 MB of hash each | 120 | +101 =12 −7 | 89.2% | **+366 ± 92** |
+
+Endings, the two programs against each other: 150 random elementary
+endings that v4 sees as won, each program once as the strong side (wins
+and their average length in plies), and 300 balanced endings of at most
+10 men from the games, each with both colors:
+
+| limit | new program wins | v4 wins | balanced endings, Elo for the new program |
+|---|---|---|---|
+| depth 1 | 148 (2 drawn), 25.8 plies | 113 (37 drawn), 41.6 plies | +64 ± 15 (+141 =427 −32) |
+| depth 2 | 148 (2 drawn), 18.8 plies | 134 (16 drawn), 45.1 plies | +78 ± 15 (+159 =415 −26) |
+| depth 3 | 150, 16.2 plies | 145 (5 drawn), 42.7 plies | +73 ± 14 (+146 =432 −22) |
+| depth 6 | 150, 14.3 plies | 150, 23.8 plies | +54 ± 12 (+104 =485 −11) |
+| 0.1 s/move | 150, 15.0 plies | 150, 16.0 plies | +22 ± 8 (+43 =552 −5) |
+
+Forced mates announced, in 290 positions where a search of depth 9 finds
+one: 87 at depth 5 (v4: 12), 208 at depth 7 (v4: 88), 284 at 0.1 s/move
+(v4: 275).
+
+The rules against python-chess, every move and every result line
+compared: 4,800 games of the program against itself, 1,500 against a
+random "human" (legal moves, illegal ones and garbage), 300 with the `c`
+command: no difference. The three binaries in the repository play the
+same game at depth 6 move for move (run on FreeBSD, Linux and macOS).
+
+The price: at the same depth a move takes longer than in v4, 30% on the
+FreeBSD host and 40% on the M1 at depth 11 (8% more nodes, 17% and 24%
+fewer nodes per second); in RAM mode 35 to 45% longer for the same table
+(as many positions searched, a quarter to a third fewer per second).
+
+How the network came to be (matches at fixed depth 7 are a cheap way to
+compare networks: 800 to 1200 games in a few minutes):
+
+| step | measured |
+|---|---|
+| first network, 128 hidden units, 2.9M positions of v4 against itself | −195 ± 60 Elo against v4 at 0.1 s/move |
+| 5.1M positions, each side's view mirrored by its king's wing | −20 ± 55 |
+| 7.9M positions, a value for every man added to the output | **+103 ± 51** (+80 ± 43 at depth 7) |
+| weight of the game result in the target 0.5 / 0.3 / 0.1 (5M positions, depth 7, against the 7.9M network) | −124 / −92 / −49 ± 21: the score of the search teaches better than the result |
+| 256 hidden units instead of 128 (same 5M positions) | +96 at depth 7, 19% fewer nodes/s |
+| 256 units, result weight 0.1, 17.4M positions of generations 1 and 2 | +169 ± 23 at depth 7, **+127 ± 49 at 0.1 s/move** over the 7.9M network |
+| 512 units | +34 ± 20 at depth 7 but −28 ± 39 at 0.1 s/move, twice the size: not taken |
+| result weight 0 | −17 ± 18 at depth 7: not taken |
+| 35.6M positions of generations 1 to 3 | +70 ± 18 at depth 7 (without generation 1: −13 ± 16, so all of it stays) |
+| 57.7M positions of generations 1 to 4: the network in `chess.go` | **+57 ± 16** at depth 7 |
+
+What did not help, measured and dropped: quiet checks in the quiescence
+search (more mates found, 48.8% in 607 games), more or less late move
+reduction, a deeper null move, pruning margins a quarter tighter (43% in
+259 games) or a quarter wider (−0 ± 20 Elo in 800), choosing quiet moves
+one by one instead of sorting them (same tree, same speed), reading the
+hash entry early (12% slower), damping the evaluation with the fifty-move
+counter (the program then postpones its pawn moves to the end of every
+line).
+
+What "not worse in any case" turned up:
+- The first networks won more slowly than v4 in a few elementary endings,
+  and one version gave a rook away to reach king and pawn against king,
+  which it knew exactly: positions known exactly, positions scored by the
+  network and positions scored as won must lie on one scale.
+- A mate in two went unseen at depth 10 because the mating move was a
+  quiet move at a node that futility pruning had given up: the checks
+  kept by the pruning.
+- At depth 1 the program stalemated a bare king in 20 of 400 games (v4 in
+  2): the quiescence search tries captures only and took the stalemate
+  for a won position. None since it knows the stalemate.
+- At depth 1 a king's step towards the bare king counted for more than a
+  pawn's step to promotion: of the 150 won endings 5 were drawn, 2 now.
+- Two games of rook against rook were lost at 0.1 s/move: the program
+  went back into a position of the game "for the draw by repetition",
+  where its opponent could simply take the rook, as it could have the
+  first time. v4 does the same; the test positions came with an invented
+  past of this kind, a human opponent makes one by overlooking a
+  capture. The new rule for repetitions is neutral in ordinary games
+  (−5 ± 20 Elo at 25,000 nodes a move, 800 games) and better in the
+  balanced endings (+57 ± 12 instead of +52 ± 11 at depth 6). The
+  stricter rule of other programs, the third occurrence for everything
+  in the game's past, cost 16 of the 150 won endings at depth 1, where
+  it is the old rule that keeps a shallow search from shuffling: so the
+  old rule stays where the search ends.
+
+New in the repository: `nnue/` (the four tools that made the network and
+how to use them), tests of the network (word arithmetic against a plain
+sum, move-by-move updates against a fresh computation, symmetries), of
+the endings known exactly, of the checks, stalemates and repetitions.
+Not measured: anything above 5 s a move, so not the default limit either
+(600 s a move on all cores).

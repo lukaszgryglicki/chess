@@ -158,12 +158,11 @@ material (K vs K, K+minor vs K, same-colored-bishops only).
 ## Engine
 
 Tournament-grade techniques, all in one file (validated feature-by-feature
-in head-to-head gauntlets — every addition had to beat the previous binary
-at real time controls or it was reverted):
+in head-to-head gauntlets — an addition that neither beat the previous
+binary nor fixed a flaw without costing strength was reverted):
 
-- **Board**: a mailbox plus incrementally maintained piece bitboards and
-  material/piece-square scores; move generation, attack detection, SEE and
-  the evaluation all run on the bitboards
+- **Board**: a mailbox plus incrementally maintained piece bitboards; move
+  generation, attack detection and SEE run on the bitboards
 - **Search**: parallel Lazy SMP on **all CPU cores** sharing a lock-free
   XOR-validated, generation-aged, 2-way bucketed transposition table that
   also caches static evals (auto-sized from available RAM, see above);
@@ -173,12 +172,14 @@ at real time controls or it was reverted):
   verification search at high depths against zugzwang); **singular
   extensions + multicut**; **probcut**; razoring; **reverse futility**,
   **futility**, **late-move** and **SEE pruning** (quiets and losing
-  captures); internal iterative reduction; mate-distance pruning; check
-  extensions; in-search repetition, 50-move and insufficient-material
-  detection
+  captures) - none of which drops a quiet move that gives check; internal
+  iterative reduction; mate-distance pruning; check extensions; in-search
+  repetition, 50-move and insufficient-material detection
 - **Quiescence**: transposition-table probing and storing, SEE (static
   exchange evaluation) pruning of losing captures, delta pruning, and full
-  check-evasion search (no stand-pat in check — finds quiescence mates)
+  check-evasion search (no stand-pat in check — finds quiescence mates);
+  a king that is left with pawns at most and has no move is the stalemate
+  it is, so even a search of depth 1 does not stalemate a bare king
 - **Move ordering**: TT move → good captures by SEE + capture history →
   promotions → killer moves → countermove → quiet history (butterfly +
   two-ply **continuation history**, gravity-updated with penalties for
@@ -187,16 +188,20 @@ at real time controls or it was reverted):
   some of them will be searched
 - **Correction history**: a pawn-structure-keyed table learns the static
   eval's bias per structure during the search and corrects it on the fly
-- **Evaluation** (tapered mg/eg by game phase, bitboard-assisted): PeSTO
-  piece-square tables and values; **piece mobility** (safe-square counts
-  per piece type); **king safety** (weighted attack units on the king ring,
-  quadratic scaling) plus king pawn-shield; **threats** (pawns attacking
-  pieces, hanging men); passed pawns (rank bonuses + blockade and king
-  proximity in the endgame); isolated / doubled / connected pawns (cached
-  in a dedicated lock-free pawn hash table keyed by an incrementally
-  maintained pawn zobrist); bishop pair; rooks on open and semi-open
-  files; drawishness scaling (opposite-colored-bishop endings, pawnless
-  advantages); the right corner for the bishop-and-knight mate; tempo
+- **Evaluation**: a small neural network, trained on nothing but games
+  the program played against itself. Each side sees the board in its own
+  way (768 inputs: own or enemy man, type, square; mirrored when its king
+  is on the files e-h), 256 hidden units per side, one output with 8 sets
+  of weights by the number of men. The hidden units are kept up to date
+  move by move and everything is plain 64-bit integer arithmetic (four
+  16-bit hidden units to a word), so it searches only about a quarter
+  fewer positions per second than the hand-written evaluation it replaced
+  and plays far better. The weights are part of `chess.go` (its last 270 KB);
+  `nnue/README.md` tells how they were made. The network is not asked
+  where the answer is known: king and pawn against king (an exact table
+  built at startup), the mates against a bare king (bishop and knight
+  included) and clearly won positions, which are scored by material and
+  progress
 - No difficulty levels — always plays at full strength for the time given.
 
 ## Testing
@@ -205,24 +210,27 @@ at real time controls or it was reverted):
 
 `chess_test.go` covers the GUI (mouse handling, rendering, options), the
 command line, the rules around repetition and en passant, the memory
-sizing, and - on a private `Xvfb`, skipped without one - the real program
-end to end: the test moves the X pointer (XTEST) and compares the window
-pixel by pixel, on 24-, 16- and 8-bit displays.
+sizing, the evaluation (the network's word arithmetic against a plain
+computation, its move-by-move updates, its symmetries, the endings known
+exactly), the checks kept by the pruning, the stalemates seen by the
+quiescence search, the repetitions the search counts as draws, and - on a
+private `Xvfb`, skipped without one - the real program end to end: the
+test moves the X pointer (XTEST) and compares the window pixel by pixel,
+on 24-, 16- and 8-bit displays.
 
     CHESS_SELFTEST=1 ./chess
 
 runs a 13-case perft suite (start position d1–d5, Kiwipete d1–d4, and four
 more standard trap positions covering en passant, promotions, castling
 edge cases) with zobrist-hash **and pawn-key** consistency, and the piece
-sets and incremental scores, verified at every visited node. All cases
-pass. Also validated: exact `d` output format,
-illegal-move rejection, wall-clock cap accuracy, multi-core scaling, full
-self-play demo games at fixed depth and timed modes, eval color-symmetry
-on mirrored positions, tactical spot checks (fool's mate, mate-in-1
-finishes, 14/16 on a Win-At-Chess sample at 2 s/move), and head-to-head
-gauntlet matches for every feature pass (see `STATS.md`).
+sets, verified at every visited node. All cases pass. Also validated:
+exact `d` output format, illegal-move rejection, wall-clock cap accuracy,
+multi-core scaling, full self-play demo games at fixed depth and timed
+modes, the rules against python-chess in thousands of games, and
+head-to-head matches for every feature pass, in every mode (see
+`STATS.md`).
 
 Env vars for testing (not part of the spec-required CLI): `CHESS_FEN`
 starts from an arbitrary FEN, `CHESS_THREADS` caps the worker count,
 `CHESS_HASH_MB` fixes the hash size, `CHESS_ONESHOT=1` plays a single move
-and exits.
+and exits, `CHESS_NET=<file>` evaluates with another network (`nnue/`).

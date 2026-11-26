@@ -15,6 +15,11 @@ repository: `chess-freebsd`, `chess-linux` (both amd64) and `chess-macos`
 (arm64). `make test` runs the tests, `make install` copies the binary to
 `$(INSTALL_DIR)/chess`.
 
+When a Mac runs `chess-macos` from an sshfs mount of this directory and the
+file is then replaced on the remote side (a rebuild, `git pull`), macOS kills
+it at start (`Killed: 9`): it still holds the code signature of the file it
+ran before. Remount sshfs to fix that.
+
 ## Usage
 
     ./chess [limit]

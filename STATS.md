@@ -345,5 +345,115 @@ New in the repository: `nnue/` (the four tools that made the network and
 how to use them), tests of the network (word arithmetic against a plain
 sum, move-by-move updates against a fresh computation, symmetries), of
 the endings known exactly, of the checks, stalemates and repetitions.
-Not measured: anything above 5 s a move, so not the default limit either
-(600 s a move on all cores).
+Longer limits than 5 s a move came later: see the follow-up below.
+
+### Follow-up the same evening: all cores, longer limits, how strong it is
+
+Asked after the above: does the search use every core in every mode, is
+the new program still the better one with 10 to 60 s a move, is the
+network all of the evaluation, and how does it compare with engines
+people know.
+
+**Cores.** One search thread per CPU in all three modes, as before. CPU
+time over wall time for one move from the start position:
+
+| machine | time limit | depth limit | RAM mode |
+|---|---|---|---|
+| FreeBSD, 16 logical CPUs (8 cores) | 15.5 | 15.5 | 15.3 |
+| macOS, M1, 8 CPUs (4 fast, 4 slow) | 7.5 | 7.5 | 7.4 |
+| Linux, a virtual machine with 16 CPUs | 15.8 | 15.9 | 15.7 |
+
+Half of these CPUs are hyperthreads on the FreeBSD machine and slow
+cores on the M1. They add a third to the positions searched per second
+(16.2M against 11.8M, 10.0M against 7.4M) and make the search wider, not
+deeper: a fixed depth is reached no sooner (ten positions to depth 20 in
+31 and 37 s with 16 threads, in 33 and 29 s with 8), and 16 threads
+against 8 at 0.3 s a move ended +7 =10 −7. Nothing is lost by taking
+every CPU; the gain is in the real cores.
+
+One thing was wrong: the number of threads was the number of CPUs of the
+machine, not the number the program may use. With 2 of 16 CPUs granted
+(`GOMAXPROCS=2`, which is what a container with a CPU limit amounts to)
+it ran 16 search threads on them and needed 6.0 s to depth 17 instead of
+2.1 s. It now asks the Go runtime (`runtime.GOMAXPROCS(0)`); on Linux
+under a real limit (`systemd-run --scope -p CPUQuota=200%`) it starts 2
+threads.
+
+In a virtual machine the count can be more than the host has to give.
+The Linux guest of the table runs on the FreeBSD machine: with the host
+idle it searched 12 million positions a second on its 16 CPUs; while the
+host ran other work a search on all 16 threads crawled - a 3 s move took
+20 s and saw 16,000 positions, where 12 threads saw 13 million - because
+every first use of a page of memory then took milliseconds. The program
+cannot see what a host has left; `CHESS_THREADS` is the remedy there.
+
+**Longer limits**, the final program against v4, the same limit for
+both, one thread each but in the last row, every opening with both
+colors. The games at 30 and 60 s and those on 8 threads were stopped
+when both programs agreed on the outcome (four moves of each with +8.00
+or more for the same side, or after 80 plies eight moves of each within
+0.15 of zero); the games at 10 s were played out. Two games that had
+passed 290 plies I stopped by hand; they count as draws (Stockfish 19
+sees 0.00 in one final position and an edge for the new program in the
+other):
+
+| limit for both | games | result | score | Elo | stopped by agreement |
+|---|---|---|---|---|---|
+| 10 s/move | 25 | +17 =6 −2 | 80.0% | **+241** (95%: +128 to +434) | none |
+| 30 s/move | 7 | +5 =2 −0 | 85.7% | – | 5 |
+| 60 s/move | 6 | +6 =0 −0 | 100.0% | – | 6 |
+| 8 threads each, 10 s/move (M1) | 4 | +2 =2 −0 | 75.0% | – | 3 |
+
+All four rows together: 42 games, +30 =10 −2, 83.3%.
+
+Nothing longer was played. What speaks for the default of 600 s: in
+equal time the two programs get about equally deep (one thread, eight
+positions, after 1, 10, 60 and 120 s: v4 depth 14.9, 20.0, 25.8 and
+27.1, the new program 14.6, 19.6, 24.8 and 26.0), and at equal depth the
+new one leads by 150 Elo at depth 1 rising to 377 at depth 10 (above).
+One move with the defaults on the M1 (600 s, 8 threads, 3 GB of hash):
+depth 30, 5.1 billion positions, played after 600.00 s, memory flat.
+
+**The network is the whole evaluation.** The search around it is the
+classical one of v4 with the changes listed above, and where the result
+is known exactly the network is not asked. Mixing the hand-written
+evaluation of v4 back in makes it weaker at equal depth, before the time
+that costs is counted: with a quarter of it −38 ± 23 Elo, with half of
+it −115 ± 25 (600 games each at depth 7).
+
+**How strong.** Matches against engines that have a rating on the CCRL
+Blitz list of 21 November 2026 (computerchess.org.uk: one CPU, games of
+2 minutes + 1 s a move on an i7-4770K), built here from their sources.
+1 s a move, one thread and 64 MB each, on a fast core of the M1, every
+opening with both colors, played out:
+
+| opponent | its rating | games | result | score |
+|---|---|---|---|---|
+| Weiss 1.1 | 2986 | 25 | +24 =0 −1 | 96.0% |
+| Weiss 1.4 | 3254 | 20 | +11 =3 −6 | 62.5% |
+| Stash 34.0 | 3315 | 32 | +7 =6 −19 | 31.2% |
+| Weiss 2.0 | 3318 | 40 | +10 =14 −16 | 42.5% |
+| Stash 37.0 | 3417 | 32 | +2 =8 −22 | 18.8% |
+| Stockfish 11 | 3563 | 32 | +1 =6 −25 | 12.5% |
+
+Over these six engines, 181 games, that is a performance of **3253** on the
+list's scale (95%: 3209 to 3295). On the same list: Stockfish 19 3790,
+Houdini 6 3468, Counter 5.5 (written in Go) 3361, Houdini 1.5a 3308,
+Shredder 13 3279, Rybka 4.1 3138, Crafty 25.3 2973, GNU Chess 5.60 2831.
+People are not on such lists; Deep Fritz 10, which beat the world
+champion Kramnik 4-2 in 2006, has 2843 to 2904 on CCRL's list for longer
+games.
+
+Stockfish 19 itself, same conditions:
+
+| Stockfish 19 | games | result | score |
+|---|---|---|---|
+| limited to Elo 2600 | 8 | +8 =0 −0 | 100.0% |
+| limited to Elo 2900 | 8 | +4 =2 −2 | 62.5% |
+| limited to Elo 3190 | 8 | +1 =0 −7 | 12.5% |
+| full strength | 8 | +0 =0 −8 | 0.0% |
+
+Its limited levels (`UCI_Elo`) are no yardstick at this speed: the labels
+were fitted at 120 s + 1 s a move and the weakened move is chosen early
+in the search, so with 1 s a move the level labelled 3190 won 7 of 8
+games against a program that the engines above put at 3250.

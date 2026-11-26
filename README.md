@@ -52,11 +52,14 @@ repository: `chess-freebsd`, `chess-linux` (both amd64) and `chess-macos`
   fill within the limit: about 48 MB per thread and second.
 - Set `CHESS_VERBOSE=1` to print the chosen hash size, memory limit and
   thread count to stderr at startup.
-- The search runs in parallel on **all CPU cores** (Lazy SMP: every core
-  searches the same position with a shared transposition table; helpers
-  spread over the search depths). On an 8-core box expect roughly 6-7x more
-  nodes searched per second than single-threaded (`CHESS_THREADS=<n>` uses
-  fewer cores).
+- The search runs in parallel on **all CPU cores**, in every mode (Lazy
+  SMP: every core searches the same position with a shared transposition
+  table; helpers spread over the search depths). The number of threads is
+  what the system reports and grants the program: all logical CPUs, fewer
+  in a container with a CPU limit. On an 8-core box expect roughly 6-7x
+  more nodes searched per second than single-threaded. `CHESS_THREADS=<n>`
+  uses fewer cores: do that in a virtual machine whose host cannot spare
+  all the CPUs the guest shows, where a search on all of them can crawl.
 - You play White and move first. Type moves in coordinate notation on stdin:
   `e2e4`, castling as the king move (`e1g1`), promotion with a suffix
   (`e7e8q`, `e7e8n`, ...). Uppercase input is accepted.
@@ -202,6 +205,12 @@ binary nor fixed a flaw without costing strength was reverted):
   built at startup), the mates against a bare king (bishop and knight
   included) and clearly won positions, which are scored by material and
   progress
+- **Strength**: with one thread and 1 s a move it performs at about 3250
+  on the scale of the CCRL Blitz list, measured against six engines rated
+  there (17-23 against Weiss 2.0, 24-1 against Weiss 1.1, 4-28 against
+  Stockfish 11). That is far beyond any human player and some 500 points
+  below Stockfish 19, which won every game. More threads and more time
+  add to it; `STATS.md` has the matches
 - No difficulty levels — always plays at full strength for the time given.
 
 ## Testing

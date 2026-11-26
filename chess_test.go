@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -896,6 +897,24 @@ Pages purgeable:                              4.
 }
 
 // ---------- command line ----------
+
+// The search runs on every CPU the program may use, on CHESS_THREADS of
+// them at most, and on no more than it had workers for at its first move.
+func TestSearchThreads(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(3))
+	for env, want := range map[string]int{"": 3, "1": 1, "2": 2, "3": 3, "4": 3, "0": 3, "x": 3} {
+		t.Setenv("CHESS_THREADS", env)
+		if got := searchThreads(); got != want {
+			t.Errorf("CHESS_THREADS=%q, 3 CPUs: %d threads, want %d", env, got, want)
+		}
+	}
+	for _, env := range []string{"1", "3"} { // one worker, then more CPUs than workers
+		t.Setenv("CHESS_THREADS", env)
+		if m := bestMove(startPos(), 0, 6); m == NoMove {
+			t.Errorf("CHESS_THREADS=%s: no move", env)
+		}
+	}
+}
 
 func TestParseArgs(t *testing.T) {
 	env := func(kv ...string) func(string) string {

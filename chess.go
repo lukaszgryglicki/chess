@@ -1368,9 +1368,11 @@ func availableRAM() uint64 {
 	return 1 << 30 // conservative 1 GiB assumption
 }
 
-// searchThreads is the number of search workers: all CPUs, or CHESS_THREADS.
+// searchThreads is the number of search workers: all the CPUs the program
+// can run on at once, or CHESS_THREADS. That is the machine's CPUs, fewer
+// where the system grants fewer (a container with a CPU limit, GOMAXPROCS).
 func searchThreads() int {
-	n := runtime.NumCPU()
+	n := runtime.GOMAXPROCS(0)
 	if v, err := strconv.Atoi(os.Getenv("CHESS_THREADS")); err == nil && v >= 1 && v <= n {
 		n = v
 	}
@@ -2726,7 +2728,10 @@ func bestMove(p *Pos, budget time.Duration, depthCap int) Move {
 	if len(legal) == 0 {
 		return NoMove
 	}
-	workers := searchThreads()
+	// engines persist across moves (one per thread): history, countermove
+	// and continuation-history knowledge carries over into the next search.
+	poolOnce.Do(func() { enginePool = make([]*Engine, searchThreads()) })
+	workers := min(searchThreads(), len(enginePool)) // CPUs granted later stay unused
 	if len(legal) == 1 {
 		if verbose {
 			vlog("forced: only one legal move -> %s", moveStr(legal[0]))
@@ -2771,9 +2776,6 @@ func bestMove(p *Pos, budget time.Duration, depthCap int) Move {
 	best := legal[0]
 	bestDepth, bestScore := 0, 0
 	ttGen.Add(1) // age the shared hash table once per move
-	// engines persist across moves (one per thread): history, countermove
-	// and continuation-history knowledge carries over into the next search.
-	poolOnce.Do(func() { enginePool = make([]*Engine, workers) })
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)

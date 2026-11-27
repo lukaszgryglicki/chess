@@ -19,6 +19,10 @@ chess-linux: chess.go
 chess-macos: chess.go
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -p $(JOBS) -o $@ chess.go
 
+# the Android app, chess-android.apk: android/README.md says what it needs
+android:
+	$(MAKE) -C android apk
+
 # the binaries need no shared library (macOS: only the system library)
 static: release
 
@@ -34,4 +38,4 @@ test:
 clean:
 	rm -f chess
 
-.PHONY: release all static install test clean
+.PHONY: release all android static install test clean

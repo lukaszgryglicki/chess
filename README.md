@@ -157,6 +157,14 @@ The limit argument and all engine behaviour are identical to text mode.
   `./chess gui demo 1` is a fast ~1 s/move show. Mode keywords and options
   may be given in any order (`demo gui` works too).
 
+### Android
+
+`android/` holds an app around the same `chess.go`: a start screen for the
+limit N, the CPU MOVE button and demo mode, then the board, played by tapping
+or dragging. `make android` builds `chess-android.apk`, for any 64-bit phone
+with Android 8 or newer; `android/README.md` says what the build needs and
+how the file gets onto a phone. Nothing else here depends on that directory.
+
 ## Full rules implemented
 
 Castling (all legality conditions), en passant, promotion (q/r/b/n), check,
